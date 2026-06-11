@@ -30,8 +30,7 @@ import (
 	"strconv"
 	"strings"
 
-	"cloud.google.com/go/storage"
-	"github.com/agent-substrate/substrate/cmd/atelet/internal/ategcs"
+	"github.com/agent-substrate/substrate/cmd/atelet/internal/objectstore"
 	"github.com/agent-substrate/substrate/internal/ateinterceptors"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/memorypullcache"
@@ -39,14 +38,11 @@ import (
 	"github.com/agent-substrate/substrate/internal/proto/ateompb"
 	"github.com/agent-substrate/substrate/internal/serverboot"
 	"github.com/agent-substrate/substrate/internal/version"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/go-containerregistry/pkg/authn"
 	googlecontainerauth "github.com/google/go-containerregistry/pkg/v1/google"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/api/option"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/reflection"
@@ -106,53 +102,15 @@ func main() {
 		serverboot.Fatal(ctx, "Failed to create pull cache", err)
 	}
 
-	anonGCSClient, err := storage.NewClient(ctx, option.WithoutAuthentication())
+	storageClient, err := objectstore.NewClient(ctx)
 	if err != nil {
-		serverboot.Fatal(ctx, "Failed to create anonymous GCS client", err)
-	}
-
-	var gcsClient *storage.Client
-	var s3Client *s3.Client
-	storageBackend := os.Getenv("ATE_STORAGE_BACKEND")
-	switch storageBackend {
-	case "s3":
-		slog.InfoContext(ctx, "Using S3 storage backend")
-		// depend on standard AWS environment variables to configure the client
-		// these will need to be set on the atelet pods
-		cfg, err := config.LoadDefaultConfig(ctx)
-		if err != nil {
-			serverboot.Fatal(ctx, "Failed to load S3 config", err)
-		}
-		s3Client = s3.NewFromConfig(cfg, func(o *s3.Options) {
-			if usePathStyle := os.Getenv("AWS_S3_USE_PATH_STYLE"); usePathStyle == "true" {
-				o.UsePathStyle = true
-			}
-		})
-	// GCS is currently the default, TODO: we assume workload identity / ADC
-	default:
-		gcsClient, err = storage.NewClient(ctx)
-		if err != nil {
-			serverboot.Fatal(ctx, "Failed to create GCS client", err)
-		}
-	}
-
-	var wrappedAnonGCS ategcs.ObjectStorage
-	if anonGCSClient != nil {
-		wrappedAnonGCS = ategcs.NewGCSClient(anonGCSClient)
-	}
-
-	var wrappedGCS ategcs.ObjectStorage
-	if s3Client != nil {
-		wrappedGCS = ategcs.NewS3Client(s3Client)
-	} else if gcsClient != nil {
-		wrappedGCS = ategcs.NewGCSClient(gcsClient)
+		serverboot.Fatal(ctx, "Failed to create object storage client", err)
 	}
 
 	wmService := NewService(
 		ctx,
 		ateomDialer,
-		wrappedAnonGCS,
-		wrappedGCS,
+		storageClient,
 		pullCache,
 	)
 
@@ -177,8 +135,7 @@ type AteomHerder struct {
 
 	ateomDialer   *AteomDialer
 	pullCache     *memorypullcache.MemoryPullCache
-	anonGCSClient ategcs.ObjectStorage
-	gcsClient     ategcs.ObjectStorage
+	storageClient objectstore.ObjectStorage
 }
 
 var _ ateletpb.AteomHerderServer = (*AteomHerder)(nil)
@@ -187,15 +144,13 @@ var _ ateletpb.AteomHerderServer = (*AteomHerder)(nil)
 func NewService(
 	ctx context.Context,
 	ateomDialer *AteomDialer,
-	anonGCSClient ategcs.ObjectStorage,
-	gcsClient ategcs.ObjectStorage,
+	storageClient objectstore.ObjectStorage,
 	pullCache *memorypullcache.MemoryPullCache,
 ) *AteomHerder {
 	wms := &AteomHerder{
 		ateomDialer:   ateomDialer,
 		pullCache:     pullCache,
-		anonGCSClient: anonGCSClient,
-		gcsClient:     gcsClient,
+		storageClient: storageClient,
 	}
 	return wms
 }
@@ -219,12 +174,7 @@ func (s *AteomHerder) fetchRunsc(ctx context.Context, cfg *ateletpb.RunscConfig)
 
 	// Fetch the file.
 
-	client := s.anonGCSClient
-	if cfg.GetAuthentication().GetGcp().GetUse() {
-		client = s.gcsClient
-	}
-
-	content, err := ategcs.FetchFromGCS(ctx, client, platCfg.GetUrl())
+	content, err := objectstore.Fetch(ctx, s.storageClient, platCfg.GetUrl())
 	if err != nil {
 		return "", fmt.Errorf("while fetching %v: %w", platCfg.GetUrl(), err)
 	}
@@ -337,20 +287,20 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	pagesMetaImgPath := filepath.Join(checkpointDir, "pages_meta.img")
 
 	// Upload checkpoint from local dir.
-	if err := ategcs.SendLocalFileToGCSWithZstd(ctx, s.gcsClient,
+	if err := objectstore.PutFileWithZstd(ctx, s.storageClient,
 		prefix+"/checkpoint.img.zstd",
 		checkpointImgPath,
 	); err != nil {
-		return nil, fmt.Errorf("while uploading checkpoint.img to GCS: %w", err)
+		return nil, fmt.Errorf("while uploading checkpoint.img: %w", err)
 	}
 
-	if err := uploadIfExists(ctx, s.gcsClient,
+	if err := uploadIfExists(ctx, s.storageClient,
 		prefix+"/pages.img.zstd",
 		pagesImgPath,
 	); err != nil {
 		return nil, err
 	}
-	if err := uploadIfExists(ctx, s.gcsClient,
+	if err := uploadIfExists(ctx, s.storageClient,
 		prefix+"/pages_meta.img.zstd",
 		pagesMetaImgPath,
 	); err != nil {
@@ -390,8 +340,8 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	} {
 		dl := dl
 		g.Go(func() error {
-			if err := ategcs.FetchLocalFileFromGCSWithZstd(gCtx, s.gcsClient, dl.remote, dl.local); err != nil {
-				return fmt.Errorf("while downloading %s from GCS: %w", filepath.Base(dl.remote), err)
+			if err := objectstore.FetchFileWithZstd(gCtx, s.storageClient, dl.remote, dl.local); err != nil {
+				return fmt.Errorf("while downloading %s: %w", filepath.Base(dl.remote), err)
 			}
 			return nil
 		})
@@ -525,15 +475,15 @@ func buildAteomWorkloadSpec(spec *ateletpb.WorkloadSpec) *ateompb.WorkloadSpec {
 	return out
 }
 
-// uploadIfExists uploads a local file to GCS (zstd-compressed) only if
-// the file is present. Missing files are silently skipped — used for
+// uploadIfExists uploads a local file (zstd-compressed) to object storage only
+// if the file is present. Missing files are silently skipped — used for
 // optional checkpoint side-files (pages.img, pages_meta.img).
-func uploadIfExists(ctx context.Context, gcs ategcs.ObjectStorage, remoteURI, localPath string) error {
+func uploadIfExists(ctx context.Context, client objectstore.ObjectStorage, remoteURI, localPath string) error {
 	if _, err := os.Stat(localPath); err != nil {
 		return nil
 	}
-	if err := ategcs.SendLocalFileToGCSWithZstd(ctx, gcs, remoteURI, localPath); err != nil {
-		return fmt.Errorf("while uploading %s to GCS: %w", filepath.Base(localPath), err)
+	if err := objectstore.PutFileWithZstd(ctx, client, remoteURI, localPath); err != nil {
+		return fmt.Errorf("while uploading %s: %w", filepath.Base(localPath), err)
 	}
 	return nil
 }

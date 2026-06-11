@@ -53,4 +53,5 @@ spec:
     - name: PORT
       value: "80"
   snapshotsConfig:
+    # Object storage URI: supports s3://bucket/path and gs://bucket/path (backward compat)
     location: gs://${BUCKET_NAME}/ate-demo-counter/

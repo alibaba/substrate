@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package ategcs
+package objectstore
 
 import (
 	"context"
@@ -27,18 +27,21 @@ import (
 	"go.opentelemetry.io/otel"
 )
 
-var tracer = otel.Tracer("ategcs")
+var tracer = otel.Tracer("objectstore")
 
+// ObjectStorage is a cloud-agnostic interface for reading and writing objects.
 type ObjectStorage interface {
 	GetObject(ctx context.Context, bucket, object string) (io.ReadCloser, error)
 	PutObject(ctx context.Context, bucket, object string, reader io.Reader) error
 }
 
-func FetchFromGCS(ctx context.Context, client ObjectStorage, gsURL string) ([]byte, error) {
-	ctx, span := tracer.Start(ctx, "fetchFromGCS")
+// Fetch downloads the object at the given URL (s3:// or gs://) and returns
+// its contents as a byte slice.
+func Fetch(ctx context.Context, client ObjectStorage, storageURL string) ([]byte, error) {
+	ctx, span := tracer.Start(ctx, "fetch")
 	defer span.End()
 
-	bucket, object, err := parseGCSURL(gsURL)
+	bucket, object, err := ParseURL(storageURL)
 	if err != nil {
 		return nil, fmt.Errorf("while parsing url: %w", err)
 	}
@@ -57,8 +60,10 @@ func FetchFromGCS(ctx context.Context, client ObjectStorage, gsURL string) ([]by
 	return content, nil
 }
 
-func SendLocalFileToGCSWithZstd(ctx context.Context, client ObjectStorage, gsURL string, localFilePath string) (err error) {
-	ctx, span := tracer.Start(ctx, "sendLocalFileToGCSWithZstd")
+// PutFileWithZstd compresses the file at localFilePath with zstd and uploads
+// it to the given object storage URL.
+func PutFileWithZstd(ctx context.Context, client ObjectStorage, storageURL string, localFilePath string) (err error) {
+	ctx, span := tracer.Start(ctx, "putFileWithZstd")
 	defer span.End()
 
 	localFile, err := os.Open(localFilePath)
@@ -75,15 +80,15 @@ func SendLocalFileToGCSWithZstd(ctx context.Context, client ObjectStorage, gsURL
 		}
 	}()
 
-	if err := sendToGCSWithZstd(ctx, client, gsURL, localFile); err != nil {
-		return fmt.Errorf("in sendToGCSWithZstd: %w", err)
+	if err := putWithZstd(ctx, client, storageURL, localFile); err != nil {
+		return fmt.Errorf("in putWithZstd: %w", err)
 	}
 
 	return nil
 }
 
-func sendToGCSWithZstd(ctx context.Context, client ObjectStorage, gsURL string, content io.Reader) (err error) {
-	bucket, object, err := parseGCSURL(gsURL)
+func putWithZstd(ctx context.Context, client ObjectStorage, storageURL string, content io.Reader) (err error) {
+	bucket, object, err := ParseURL(storageURL)
 	if err != nil {
 		return fmt.Errorf("while parsing URL: %w", err)
 	}
@@ -122,8 +127,10 @@ func sendToGCSWithZstd(ctx context.Context, client ObjectStorage, gsURL string, 
 	return nil
 }
 
-func FetchLocalFileFromGCSWithZstd(ctx context.Context, client ObjectStorage, gsURL string, localFilePath string) (err error) {
-	ctx, span := tracer.Start(ctx, "fetchLocalFileFromGCSWithZstd")
+// FetchFileWithZstd downloads an object from the given URL, decompresses it
+// with zstd, and writes it to localFilePath.
+func FetchFileWithZstd(ctx context.Context, client ObjectStorage, storageURL string, localFilePath string) (err error) {
+	ctx, span := tracer.Start(ctx, "fetchFileWithZstd")
 	defer span.End()
 
 	localFile, err := os.Create(localFilePath)
@@ -144,15 +151,15 @@ func FetchLocalFileFromGCSWithZstd(ctx context.Context, client ObjectStorage, gs
 		return fmt.Errorf("in localFile.Chmod(0o600): %w", err)
 	}
 
-	if err := fetchFromGCSWithZstd(ctx, client, gsURL, localFile); err != nil {
-		return fmt.Errorf("while fetching %q from GCS: %w", gsURL, err)
+	if err := fetchWithZstd(ctx, client, storageURL, localFile); err != nil {
+		return fmt.Errorf("while fetching %q from object store: %w", storageURL, err)
 	}
 
 	return nil
 }
 
-func fetchFromGCSWithZstd(ctx context.Context, client ObjectStorage, gsURL string, out io.Writer) (err error) {
-	bucket, object, err := parseGCSURL(gsURL)
+func fetchWithZstd(ctx context.Context, client ObjectStorage, storageURL string, out io.Writer) (err error) {
+	bucket, object, err := ParseURL(storageURL)
 	if err != nil {
 		return fmt.Errorf("while parsing URL: %w", err)
 	}
@@ -185,10 +192,19 @@ func fetchFromGCSWithZstd(ctx context.Context, client ObjectStorage, gsURL strin
 	return nil
 }
 
-func parseGCSURL(gsURL string) (string, string, error) {
-	parsed, err := url.Parse(gsURL)
+// ParseURL parses an object storage URL (s3:// or gs://) and returns the
+// bucket and object path. Both schemes are supported for backward compatibility.
+func ParseURL(storageURL string) (string, string, error) {
+	parsed, err := url.Parse(storageURL)
 	if err != nil {
-		return "", "", fmt.Errorf("while parsing %q: %w", gsURL, err)
+		return "", "", fmt.Errorf("while parsing %q: %w", storageURL, err)
+	}
+
+	switch parsed.Scheme {
+	case "s3", "gs":
+		// both supported
+	default:
+		return "", "", fmt.Errorf("unsupported URL scheme %q in %q (supported: s3://, gs://)", parsed.Scheme, storageURL)
 	}
 
 	return parsed.Host, strings.TrimPrefix(parsed.Path, "/"), nil

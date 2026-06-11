@@ -77,6 +77,7 @@ spec:
     namespace: claude-multiplex-demo
     name: claude-workerpool
   snapshotsConfig:
+    # Object storage URI: supports s3://bucket/path and gs://bucket/path (backward compat)
     location: gs://${BUCKET_NAME}/claude-multiplex-demo/
 
 ---
@@ -111,6 +112,7 @@ spec:
     namespace: claude-multiplex-demo
     name: claude-workerpool
   snapshotsConfig:
+    # Object storage URI: supports s3://bucket/path and gs://bucket/path (backward compat)
     location: gs://${BUCKET_NAME}/claude-multiplex-demo/
 
 ---
@@ -145,4 +147,5 @@ spec:
     namespace: claude-multiplex-demo
     name: claude-workerpool
   snapshotsConfig:
+    # Object storage URI: supports s3://bucket/path and gs://bucket/path (backward compat)
     location: gs://${BUCKET_NAME}/claude-multiplex-demo/

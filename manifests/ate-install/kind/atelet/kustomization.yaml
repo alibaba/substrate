@@ -36,16 +36,18 @@ patches:
               env:
               - name: OTEL_EXPORTER_OTLP_ENDPOINT
                 value: http://opentelemetry-collector.otel-system.svc:4317
-              - name: ATE_STORAGE_BACKEND
-                value: s3
-              - name: AWS_REGION
-                value: us-east-1
-              - name: AWS_ENDPOINT_URL
+              # Deprecated: ATE_STORAGE_BACKEND is superseded by ATE_OBJECTSTORE_* vars.
+              # - name: ATE_STORAGE_BACKEND
+              #   value: s3
+              # Cloud-agnostic object storage configuration
+              - name: ATE_OBJECTSTORE_ENDPOINT
                 value: http://rustfs.ate-system.svc:9000
-              - name: AWS_S3_USE_PATH_STYLE
+              - name: ATE_OBJECTSTORE_REGION
+                value: us-east-1
+              - name: ATE_OBJECTSTORE_USE_PATH_STYLE
                 value: "true"
               # TODO: use a secret / identity management
-              - name: AWS_ACCESS_KEY_ID
+              - name: ATE_OBJECTSTORE_ACCESS_KEY_ID
                 value: rustfsadmin
-              - name: AWS_SECRET_ACCESS_KEY
+              - name: ATE_OBJECTSTORE_SECRET_ACCESS_KEY
                 value: rustfsadmin

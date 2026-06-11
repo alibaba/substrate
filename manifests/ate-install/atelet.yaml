@@ -78,8 +78,20 @@ spec:
               fieldPath: spec.nodeName
         - name: OTEL_EXPORTER_OTLP_ENDPOINT
           value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
-        - name: ATE_STORAGE_BACKEND
-          value: "gcs"
+        # Deprecated: ATE_STORAGE_BACKEND is superseded by ATE_OBJECTSTORE_* vars.
+        # Left here for backward compatibility; remove once all deployments are migrated.
+        # - name: ATE_STORAGE_BACKEND
+        #   value: "gcs"
+        # Cloud-agnostic object storage configuration (S3-compatible protocol)
+        # Supported backends: AWS S3, Alibaba Cloud OSS, GCS (S3-compat), MinIO, Cloudflare R2
+        - name: ATE_OBJECTSTORE_ENDPOINT
+          value: ""  # e.g. https://oss-ap-northeast-1.aliyuncs.com
+        - name: ATE_OBJECTSTORE_REGION
+          value: ""
+        - name: ATE_OBJECTSTORE_ACCESS_KEY_ID
+          value: ""
+        - name: ATE_OBJECTSTORE_SECRET_ACCESS_KEY
+          value: ""
         ports:
         - name: grpc
           containerPort: 8085
