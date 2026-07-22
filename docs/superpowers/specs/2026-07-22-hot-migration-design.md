@@ -141,6 +141,20 @@ The benchmark result must include:
 - checksum/counter before and after;
 - total time from migration RPC start to first successful target response.
 
+## Confidence Burn-Down
+
+Before the full implementation starts, burn down the highest-risk assumptions with targeted checks:
+
+| Risk | Burn-down check | Confidence impact |
+|---|---|---:|
+| Proto/gRPC generation breaks because new RPCs touch public API | Run the repo's existing `go generate` path and compile `pkg/proto/ateapipb` before control-plane work | Raises plan execution confidence by about 0.04 |
+| Current actor model cannot safely reserve two workers | Add a fake-store/fake-atelet test that assigns source and candidate target simultaneously without releasing source | Raises MVP confidence by about 0.08 |
+| Router route state may not be observable fast enough for drain/switch | Add a route resolver test that uses `GetActor` first and only falls back to `ResumeActor` for suspended actors | Raises HTTP continuity confidence by about 0.04 |
+| Final checkpoint dominates cutover | Make `final_checkpoint_ms` a required benchmark field and gate incremental checkpoint work on that number | Raises SLO confidence by about 0.06 after first run |
+| Test data may prove only "recover after outage" instead of hot migration | Require continuous request stream before, during, and after migration with generation/node in every successful response | Raises evidence confidence by about 0.06 |
+
+The implementation plan must start with these checks. If any check fails, fix the design before continuing to broad code changes.
+
 ## Confidence
 
 | Scope | Confidence after implementation |
@@ -151,4 +165,3 @@ The benchmark result must include:
 | Original TCP connection preservation across nodes | 0.20-0.35 |
 
 The confidence increase comes from removing full restore from the cutover path, adding router drain, adding an explicit route generation, and validating under continuous load.
-

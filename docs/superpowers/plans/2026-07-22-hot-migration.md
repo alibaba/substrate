@@ -23,8 +23,9 @@
 |---|---|
 | `pkg/proto/ateapipb/ateapi.proto` | Public migration RPCs and actor route/migration state. |
 | `pkg/proto/ateapipb/ateapi.pb.go` | Generated Go proto. |
+| `pkg/proto/ateapipb/ateapi_grpc.pb.go` | Generated gRPC service bindings. |
 | `cmd/ateapi/internal/store/store.go` | Store interface additions only if route gets a separate key; version 1 keeps route on `Actor`, so no new store methods required. |
-| `cmd/ateapi/internal/controlapi/migrate_actor.go` | RPC handlers for prepare, commit, abort, and get route. |
+| `cmd/ateapi/internal/controlapi/migrate_actor.go` | `Service` RPC handlers for prepare, commit, abort, and get route. |
 | `cmd/ateapi/internal/controlapi/workflow_migrate.go` | Migration workflow orchestration and steps. |
 | `cmd/ateapi/internal/controlapi/workflow_migrate_test.go` | Unit tests for migration state transitions and rollback. |
 | `cmd/ateapi/internal/controlapi/worker_selection.go` | Shared worker selection helpers if extracted from resume workflow. |
@@ -39,11 +40,106 @@
 | `benchmarking/perfkit/internal/runner/hot_migration_test.go` | Benchmark parser/unit tests. |
 | `docs/hot-migration-runbook.md` | How to run the 16GiB cross-node hot migration benchmark and interpret results. |
 
+## Task 0: Confidence Burn-Down Before Broad Implementation
+
+**Preflight result on 2026-07-22:** Steps 1-4 were checked against the current workspace. Proto generation uses `pkg/proto/ateapipb/gen.go` and `internal/proto/ateletpb/gen.go`; control API handlers use `*Service`; `functional_test.go` has a fake atelet with `Checkpoint` and `Restore` request capture; direct HTTP proxy exists behind `--direct-http-proxy`. The remaining confidence work is the dual-worker functional test required in Step 5.
+
+**Files:**
+- Read: `pkg/proto/ateapipb/gen.go`
+- Read: `internal/proto/ateletpb/gen.go`
+- Read: `cmd/ateapi/internal/controlapi/service.go`
+- Read: `cmd/ateapi/internal/controlapi/functional_test.go`
+- Read: `cmd/atenet/internal/router/direct_proxy.go`
+- Modify: `docs/superpowers/plans/2026-07-22-hot-migration.md` only if a checked assumption is false
+
+- [ ] **Step 1: Verify proto generation commands**
+
+Run:
+
+```bash
+rg -n "go:generate" pkg/proto/ateapipb internal/proto/ateletpb
+```
+
+Expected output includes:
+
+```text
+pkg/proto/ateapipb/gen.go:... go:generate ... ateapi.proto
+internal/proto/ateletpb/gen.go:... go:generate ... atelet.proto
+```
+
+If either line is missing, stop and update Task 1 or Task 10 before changing proto files.
+
+- [ ] **Step 2: Verify control API receiver and test harness**
+
+Run:
+
+```bash
+rg -n "type Service|UnimplementedControlServer|RegisterControlServer|FakeAteletServer|func \\(s \\*Service\\) ResumeActor" cmd/ateapi/internal/controlapi -S
+```
+
+Expected output proves:
+
+```text
+cmd/ateapi/internal/controlapi/service.go:... type Service struct
+cmd/ateapi/internal/controlapi/service.go:... ateapipb.UnimplementedControlServer
+cmd/ateapi/internal/controlapi/functional_test.go:... type FakeAteletServer struct
+cmd/ateapi/internal/controlapi/resume_actor.go:... func (s *Service) ResumeActor
+```
+
+If the receiver is not `*Service`, update all RPC handler snippets before implementation.
+
+- [ ] **Step 3: Verify dual-worker test can be built on existing fake atelet**
+
+Run:
+
+```bash
+sed -n '150,240p' cmd/ateapi/internal/controlapi/functional_test.go
+```
+
+Expected: `FakeAteletServer` has both `Checkpoint` and `Restore`, and stores the last request. This is required for a high-confidence prepare/commit functional test.
+
+- [ ] **Step 4: Verify router direct proxy is available for the first e2e test**
+
+Run:
+
+```bash
+rg -n "DirectHTTPProxy|serveDirectHTTPProxy|handleDirectProxy" cmd/atenet/internal/router.go cmd/atenet/internal/router -S
+```
+
+Expected output includes `DirectHTTPProxy`, `serveDirectHTTPProxy`, and `handleDirectProxy`. If direct proxy is missing, implement it before hot migration routing because Envoy image availability previously blocked testing.
+
+- [ ] **Step 5: Add a minimum functional-test requirement before coding Task 3**
+
+Before Task 3 is considered complete, the implementation must include a functional test with this shape:
+
+```go
+func TestPrepareActorMigrationKeepsSourceAndRestoresTarget(t *testing.T) {
+	// Create actor, create two workers on different nodes, resume actor on worker A.
+	// Call PrepareActorMigration(require_cross_node=true).
+	// Assert worker A remains assigned to the actor as route.active.
+	// Assert worker B is assigned to the actor as route.candidate.
+	// Assert fake atelet Restore was called for worker B.
+	// Assert actor route phase is PREPARING or TARGET_READY and HTTP route still points at worker A.
+}
+```
+
+- [ ] **Step 6: Commit any plan corrections**
+
+If Steps 1-4 reveal a mismatch, edit this plan before implementation and commit:
+
+```bash
+git add docs/superpowers/plans/2026-07-22-hot-migration.md
+git commit -m "docs: tighten hot migration confidence gates"
+```
+
+If no mismatch is found, do not create an empty commit.
+
 ## Task 1: Add Proto API and Route State
 
 **Files:**
 - Modify: `pkg/proto/ateapipb/ateapi.proto`
 - Modify: `pkg/proto/ateapipb/ateapi.pb.go`
+- Modify: `pkg/proto/ateapipb/ateapi_grpc.pb.go`
 
 - [ ] **Step 1: Edit `pkg/proto/ateapipb/ateapi.proto`**
 
@@ -173,7 +269,7 @@ Run:
 go generate ./pkg/proto/ateapipb
 ```
 
-Expected: `pkg/proto/ateapipb/ateapi.pb.go` and gRPC bindings contain `PrepareActorMigration`, `CommitActorMigration`, `AbortActorMigration`, and `GetActorRoute`.
+Expected: `pkg/proto/ateapipb/ateapi.pb.go` and `pkg/proto/ateapipb/ateapi_grpc.pb.go` contain `PrepareActorMigration`, `CommitActorMigration`, `AbortActorMigration`, and `GetActorRoute`.
 
 - [ ] **Step 3: Verify proto formatting**
 
@@ -189,7 +285,7 @@ Expected: proto formatting completes and the package test exits successfully.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add pkg/proto/ateapipb/ateapi.proto pkg/proto/ateapipb/ateapi.pb.go
+git add pkg/proto/ateapipb/ateapi.proto pkg/proto/ateapipb/ateapi.pb.go pkg/proto/ateapipb/ateapi_grpc.pb.go
 git commit -m "api: add actor hot migration route state"
 ```
 
@@ -502,7 +598,7 @@ Then replace the temporary return in `PrepareActorMigration` with a workflow tha
 In the existing control API server file that handles `ResumeActor`, add:
 
 ```go
-func (s *Server) PrepareActorMigration(ctx context.Context, req *ateapipb.PrepareActorMigrationRequest) (*ateapipb.PrepareActorMigrationResponse, error) {
+func (s *Service) PrepareActorMigration(ctx context.Context, req *ateapipb.PrepareActorMigrationRequest) (*ateapipb.PrepareActorMigrationResponse, error) {
 	ref := req.GetActor()
 	actor, err := s.workflow.PrepareActorMigration(ctx, ref.GetAtespace(), ref.GetName(), req.GetRequireCrossNode())
 	if err != nil {
@@ -722,7 +818,7 @@ Release the candidate worker after the actor update, checking assignment ownersh
 Add handlers:
 
 ```go
-func (s *Server) CommitActorMigration(ctx context.Context, req *ateapipb.CommitActorMigrationRequest) (*ateapipb.CommitActorMigrationResponse, error) {
+func (s *Service) CommitActorMigration(ctx context.Context, req *ateapipb.CommitActorMigrationRequest) (*ateapipb.CommitActorMigrationResponse, error) {
 	ref := req.GetActor()
 	drain := time.Duration(req.GetDrainTimeoutMs()) * time.Millisecond
 	if drain <= 0 {
@@ -735,7 +831,7 @@ func (s *Server) CommitActorMigration(ctx context.Context, req *ateapipb.CommitA
 	return &ateapipb.CommitActorMigrationResponse{Actor: actor}, nil
 }
 
-func (s *Server) AbortActorMigration(ctx context.Context, req *ateapipb.AbortActorMigrationRequest) (*ateapipb.AbortActorMigrationResponse, error) {
+func (s *Service) AbortActorMigration(ctx context.Context, req *ateapipb.AbortActorMigrationRequest) (*ateapipb.AbortActorMigrationResponse, error) {
 	ref := req.GetActor()
 	actor, err := s.workflow.AbortActorMigration(ctx, ref.GetAtespace(), ref.GetName())
 	if err != nil {
@@ -1561,6 +1657,7 @@ git commit -m "docs: add hot migration runbook"
 - Modify: `cmd/atelet/main.go`
 - Modify: `internal/proto/ateletpb/atelet.proto`
 - Modify: generated `internal/proto/ateletpb/atelet.pb.go`
+- Modify: generated `internal/proto/ateletpb/atelet_grpc.pb.go`
 
 - [ ] **Step 1: Decide from data**
 
@@ -1610,7 +1707,7 @@ Expected: `final_checkpoint_ms` drops relative to the previous run. If it does n
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/proto/ateletpb cmd/ateapi/internal/controlapi cmd/atelet
+git add internal/proto/ateletpb/atelet.proto internal/proto/ateletpb/atelet.pb.go internal/proto/ateletpb/atelet_grpc.pb.go cmd/ateapi/internal/controlapi cmd/atelet
 git commit -m "checkpoint: prefer incremental final migration snapshots"
 ```
 
@@ -1691,7 +1788,7 @@ git commit -m "docs: record hot migration validation results"
 ## Self-Review
 
 - Spec coverage: route state, make-before-break migration, router drain, quiesce, rollback, observability, and 16GiB cross-node validation each have a task.
+- Confidence coverage: Task 0 front-loads proto generation, receiver naming, fake atelet feasibility, direct proxy availability, and the dual-worker functional-test requirement.
 - Placeholder scan: the plan avoids unspecified future work in the MVP. The only conditional work is Task 10, gated by measured `final_checkpoint_ms`.
 - Type consistency: proto names use `ActorRoute`, `ActorMigration`, `RouteTarget`, and phase enums consistently across control API, router, and perfkit.
 - Risk: Task 3 and Task 4 touch existing worker assignment and checkpoint code where the worktree already has unrelated changes. Implementation must read current files before editing and must not revert those changes.
-
