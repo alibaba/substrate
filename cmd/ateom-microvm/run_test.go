@@ -33,3 +33,35 @@ func TestBuildVMConfigDisablesCloudHypervisorCoreScheduling(t *testing.T) {
 		t.Fatalf("cpus config = %s, want core_scheduling Off", got)
 	}
 }
+
+func TestWithTapNetConfigAddsMigrationCompatibleNetDevice(t *testing.T) {
+	cfg := buildVMConfig("sandbox", "/kernel", "/image", "", "/serial.log", 256, 1)
+
+	withTapNetConfig(&cfg, "tap0_kata")
+
+	if len(cfg.Net) != 1 {
+		t.Fatalf("len(cfg.Net) = %d, want 1", len(cfg.Net))
+	}
+	net := cfg.Net[0]
+	if net.Tap != "tap0_kata" {
+		t.Fatalf("net tap = %q, want tap0_kata", net.Tap)
+	}
+	if net.MAC != actorGuestMAC {
+		t.Fatalf("net mac = %q, want %q", net.MAC, actorGuestMAC)
+	}
+	if net.NumQueues != 2 {
+		t.Fatalf("net num_queues = %d, want 2", net.NumQueues)
+	}
+}
+
+func TestLiveMigrationTapNetEnabled(t *testing.T) {
+	t.Setenv("ATE_CH_TAP_NET", "")
+	if liveMigrationTapNetEnabled() {
+		t.Fatal("liveMigrationTapNetEnabled() = true, want false")
+	}
+
+	t.Setenv("ATE_CH_TAP_NET", "1")
+	if !liveMigrationTapNetEnabled() {
+		t.Fatal("liveMigrationTapNetEnabled() = false, want true")
+	}
+}

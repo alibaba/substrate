@@ -264,12 +264,39 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 
 	// Launch a bare VMM (CH + api-socket); ateom owns this process for teardown.
 	apiSocket := filepath.Join(kata.VMDir(name), "clh-api.sock")
-	chCmd, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
-		Binary:    rr.chBinary,
-		APISocket: apiSocket,
-		Stdout:    slogWriter{ctx},
-		Stderr:    slogWriter{ctx},
-	})
+	var tapFiles []*os.File
+	defer func() {
+		for _, f := range tapFiles {
+			_ = f.Close() // CH dups adopted FDs; ours always close.
+		}
+	}()
+	tapNet := liveMigrationTapNetEnabled()
+	if tapNet {
+		// For Cloud Hypervisor live migration the network backend must be
+		// reconstructable on the destination. A tap name in VM config satisfies
+		// that, but CH must run in the netns where the tap exists.
+		tapFiles, err = s.setupRestoreTap(ctx, "tap0_kata", 1)
+		if err != nil {
+			return nil, fmt.Errorf("while building tap: %w", err)
+		}
+	}
+	var chCmd *exec.Cmd
+	var client *ch.Client
+	launch := func(context.Context) error {
+		var launchErr error
+		chCmd, client, launchErr = ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
+			Binary:    rr.chBinary,
+			APISocket: apiSocket,
+			Stdout:    slogWriter{ctx},
+			Stderr:    slogWriter{ctx},
+		})
+		return launchErr
+	}
+	if tapNet {
+		err = netNSDo(ctx, s.interiorNetNS, launch)
+	} else {
+		err = launch(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("while launching VMM: %w", err)
 	}
@@ -286,27 +313,27 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	// below, so keep it here.
 	serialLog := filepath.Join(kata.VMDir(name), "serial.log")
 	vmCfg := buildVMConfig(name, kernel, image, kparams, serialLog, memMiB, vcpus)
+	if tapNet {
+		withTapNetConfig(&vmCfg, "tap0_kata")
+	}
 	if err := client.CreateVM(ctx, vmCfg); err != nil {
 		return nil, fmt.Errorf("while creating VM: %w", err)
 	}
 
-	// Network device: build the tap + TC mirror against the actor veth and add a
-	// virtio-net to the created (pre-boot) VM with the tap FDs (SCM_RIGHTS).
-	tapFiles, err := s.setupRestoreTap(ctx, "tap0_kata", 1)
-	if err != nil {
-		return nil, fmt.Errorf("while building tap: %w", err)
-	}
-	defer func() {
-		for _, f := range tapFiles {
-			_ = f.Close() // CH dups adopted FDs; ours always close.
+	if !tapNet {
+		// Network device: build the tap + TC mirror against the actor veth and add a
+		// virtio-net to the created (pre-boot) VM with the tap FDs (SCM_RIGHTS).
+		tapFiles, err = s.setupRestoreTap(ctx, "tap0_kata", 1)
+		if err != nil {
+			return nil, fmt.Errorf("while building tap: %w", err)
 		}
-	}()
-	var fds []int
-	for _, f := range tapFiles {
-		fds = append(fds, int(f.Fd()))
-	}
-	if err := client.AddNetWithFDs(ctx, actorGuestMAC, 2*len(tapFiles), fds); err != nil {
-		return nil, fmt.Errorf("while adding net device: %w", err)
+		var fds []int
+		for _, f := range tapFiles {
+			fds = append(fds, int(f.Fd()))
+		}
+		if err := client.AddNetWithFDs(ctx, actorGuestMAC, 2*len(tapFiles), fds); err != nil {
+			return nil, fmt.Errorf("while adding net device: %w", err)
+		}
 	}
 
 	// Boot.
@@ -472,6 +499,19 @@ func buildVMConfig(id, kernel, image, kparams, serialLog string, memMiB, vcpus i
 		Serial:   &ch.ConsoleConfig{Mode: "File", File: serialLog},
 		Vsock:    &ch.VsockConfig{Cid: 3, Socket: kata.VsockSocketPath(id)},
 	}
+}
+
+func liveMigrationTapNetEnabled() bool {
+	return os.Getenv("ATE_CH_TAP_NET") == "1"
+}
+
+func withTapNetConfig(cfg *ch.VmConfig, tapName string) {
+	cfg.Net = append(cfg.Net, ch.NetConfig{
+		Tap:       tapName,
+		MAC:       actorGuestMAC,
+		NumQueues: 2,
+		QueueSize: 1024,
+	})
 }
 
 // startActorContainers performs the post-boot kata-agent setup the shim normally

@@ -27,6 +27,7 @@ type VmConfig struct {
 	Memory   MemoryConfig    `json:"memory"`
 	Payload  PayloadConfig   `json:"payload"`
 	Disks    []DiskConfig    `json:"disks,omitempty"`
+	Net      []NetConfig     `json:"net,omitempty"`
 	Fs       []FsConfig      `json:"fs,omitempty"`
 	Rng      *RngConfig      `json:"rng,omitempty"`
 	Serial   *ConsoleConfig  `json:"serial,omitempty"`
@@ -83,6 +84,16 @@ type DiskConfig struct {
 	NumQueues int32  `json:"num_queues,omitempty"`
 	QueueSize int32  `json:"queue_size,omitempty"`
 	ImageType string `json:"image_type,omitempty"`
+}
+
+// NetConfig is one virtio-net device. Tap names require CH to run in the netns
+// where the tap exists; unlike fd-backed net devices, this config can be rebuilt
+// by Cloud Hypervisor live migration on the destination host.
+type NetConfig struct {
+	Tap       string `json:"tap,omitempty"`
+	MAC       string `json:"mac,omitempty"`
+	NumQueues int32  `json:"num_queues,omitempty"`
+	QueueSize int32  `json:"queue_size,omitempty"`
 }
 
 // RngConfig sets the entropy source (kata uses /dev/urandom).
