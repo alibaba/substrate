@@ -103,6 +103,8 @@ type RouterServer struct {
 	health     *routerHealth
 	atStore    atStore
 	inflight   *inFlightTracker
+
+	directProxyTransport http.RoundTripper
 }
 
 func NewRouterServer(cfg RouterConfig) (*RouterServer, error) {
