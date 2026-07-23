@@ -22,6 +22,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 type migrationSender struct {
@@ -93,8 +94,7 @@ func (s migrationSender) startProxyWithListen(ctx context.Context, listen func(n
 
 func proxyMigrationTCPConn(ctx context.Context, src net.Conn, destinationAddress string) {
 	defer src.Close()
-	var d net.Dialer
-	dst, err := d.DialContext(ctx, "tcp", destinationAddress)
+	dst, err := dialTCPRetry(ctx, destinationAddress, 10*time.Second)
 	if err != nil {
 		slog.WarnContext(ctx, "live migration sender proxy failed to connect to destination",
 			slog.String("destination", destinationAddress), slog.Any("err", err))
@@ -115,4 +115,23 @@ func proxyMigrationTCPConn(ctx context.Context, src net.Conn, destinationAddress
 		_ = closeWrite(src)
 	}()
 	wg.Wait()
+}
+
+func dialTCPRetry(ctx context.Context, address string, timeout time.Duration) (net.Conn, error) {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	var d net.Dialer
+	for time.Now().Before(deadline) {
+		conn, err := d.DialContext(ctx, "tcp", address)
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	return nil, fmt.Errorf("tcp destination %q not ready after %s: %w", address, timeout, lastErr)
 }

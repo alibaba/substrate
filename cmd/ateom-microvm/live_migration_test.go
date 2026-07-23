@@ -219,3 +219,78 @@ func TestMigrationSenderProxyForwardsTCPToTCP(t *testing.T) {
 		t.Fatal("destination server did not finish")
 	}
 }
+
+func TestMigrationSenderProxyRetriesDelayedDestination(t *testing.T) {
+	portLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve destination tcp port: %v", err)
+	}
+	dstAddr := portLis.Addr().String()
+	if err := portLis.Close(); err != nil {
+		t.Fatalf("close reserved destination tcp port: %v", err)
+	}
+
+	sender, err := newMigrationSender("tcp:" + dstAddr)
+	if err != nil {
+		t.Fatalf("newMigrationSender: %v", err)
+	}
+	chURL, stop, err := sender.startProxy(context.Background())
+	if err != nil {
+		t.Fatalf("startProxy: %v", err)
+	}
+	defer stop()
+
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(chURL, "tcp:"), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial source proxy: %v", err)
+	}
+	defer conn.Close()
+
+	done := make(chan struct{})
+	time.AfterFunc(150*time.Millisecond, func() {
+		dstLis, err := net.Listen("tcp", dstAddr)
+		if err != nil {
+			t.Errorf("listen delayed destination tcp: %v", err)
+			close(done)
+			return
+		}
+		defer dstLis.Close()
+		defer close(done)
+
+		dstConn, err := dstLis.Accept()
+		if err != nil {
+			t.Errorf("destination accept: %v", err)
+			return
+		}
+		defer dstConn.Close()
+		buf := make([]byte, len("ping"))
+		if _, err := dstConn.Read(buf); err != nil {
+			t.Errorf("destination read: %v", err)
+			return
+		}
+		if string(buf) != "ping" {
+			t.Errorf("destination read %q, want ping", string(buf))
+			return
+		}
+		if _, err := dstConn.Write([]byte("pong")); err != nil {
+			t.Errorf("destination write: %v", err)
+		}
+	})
+
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("proxy write: %v", err)
+	}
+	buf := make([]byte, len("pong"))
+	if _, err := conn.Read(buf); err != nil {
+		t.Fatalf("proxy read: %v", err)
+	}
+	if string(buf) != "pong" {
+		t.Fatalf("proxy read %q, want pong", string(buf))
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("destination server did not finish")
+	}
+}
