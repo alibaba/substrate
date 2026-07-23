@@ -123,8 +123,18 @@ func (s *AteomService) ReceiveLiveMigration(ctx context.Context, req *ateompb.Re
 		}
 	}()
 
+	receiver, err := newMigrationReceiver(req.GetReceiverUrl(), kata.VMDir(name))
+	if err != nil {
+		return nil, err
+	}
+	stopProxy, err := receiver.startProxy(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer stopProxy()
+
 	if err := client.ReceiveMigration(ctx, ch.ReceiveMigrationOptions{
-		ReceiverURL: req.GetReceiverUrl(),
+		ReceiverURL: receiver.chURL,
 		TLSDir:      req.GetTlsDir(),
 		MemoryMode:  firstNonEmpty(req.GetMemoryMode(), "Precopy"),
 	}); err != nil {
