@@ -474,6 +474,15 @@ func runHotMigrationSample(ctx context.Context, client *ateclient.Client, prober
 		return true
 	}
 
+	start = time.Now()
+	warmupProbe, err := waitForHTTPProbe(ctx, prober, cfg.Atespace, actor, cfg.ProbePath, cfg.PostCommitProbeTimeout)
+	end = time.Now()
+	recordHTTPProbe("http_probe_router_warmup", start, end, warmupProbe, err)
+	if err != nil {
+		runBestEffortActorCleanup(ctx, client, enc, encMu, cfg.LifecycleConfig, actor, ref)
+		return failed
+	}
+
 	for mutation := 0; mutation < cfg.StateMutations; mutation++ {
 		start = time.Now()
 		mutationProbe, mutateErr := prober.Do(ctx, http.MethodPost, cfg.Atespace, actor, cfg.MutationPath)

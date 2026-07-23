@@ -265,11 +265,7 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 	// Launch a bare VMM (CH + api-socket); ateom owns this process for teardown.
 	apiSocket := filepath.Join(kata.VMDir(name), "clh-api.sock")
 	var tapFiles []*os.File
-	defer func() {
-		for _, f := range tapFiles {
-			_ = f.Close() // CH dups adopted FDs; ours always close.
-		}
-	}()
+	defer closeTapFiles(tapFiles) // CH dups adopted FDs; ours always close.
 	tapNet := liveMigrationTapNetEnabled()
 	if tapNet {
 		// For Cloud Hypervisor live migration the network backend must be
@@ -279,6 +275,10 @@ func (s *AteomService) RunWorkload(ctx context.Context, req *ateompb.RunWorkload
 		if err != nil {
 			return nil, fmt.Errorf("while building tap: %w", err)
 		}
+		// In tap-name mode CH opens the tap itself by name. Holding ateom's
+		// creation FDs open makes CH's open fail with EBUSY.
+		closeTapFiles(tapFiles)
+		tapFiles = nil
 	}
 	var chCmd *exec.Cmd
 	var client *ch.Client
@@ -503,6 +503,14 @@ func buildVMConfig(id, kernel, image, kparams, serialLog string, memMiB, vcpus i
 
 func liveMigrationTapNetEnabled() bool {
 	return os.Getenv("ATE_CH_TAP_NET") == "1"
+}
+
+func closeTapFiles(files []*os.File) {
+	for _, f := range files {
+		if f != nil {
+			_ = f.Close()
+		}
+	}
 }
 
 func withTapNetConfig(cfg *ch.VmConfig, tapName string) {

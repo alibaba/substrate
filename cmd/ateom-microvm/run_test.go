@@ -18,6 +18,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -63,5 +64,25 @@ func TestLiveMigrationTapNetEnabled(t *testing.T) {
 	t.Setenv("ATE_CH_TAP_NET", "1")
 	if !liveMigrationTapNetEnabled() {
 		t.Fatal("liveMigrationTapNetEnabled() = false, want true")
+	}
+}
+
+func TestCloseTapFilesClosesAllOpenFiles(t *testing.T) {
+	f1, err := os.CreateTemp(t.TempDir(), "tap-1-*")
+	if err != nil {
+		t.Fatalf("create temp file 1: %v", err)
+	}
+	f2, err := os.CreateTemp(t.TempDir(), "tap-2-*")
+	if err != nil {
+		t.Fatalf("create temp file 2: %v", err)
+	}
+
+	closeTapFiles([]*os.File{f1, nil, f2})
+
+	if _, err := f1.Write([]byte("x")); err == nil {
+		t.Fatal("first file is still writable after closeTapFiles")
+	}
+	if _, err := f2.Write([]byte("x")); err == nil {
+		t.Fatal("second file is still writable after closeTapFiles")
 	}
 }

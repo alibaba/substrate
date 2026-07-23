@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -94,11 +95,7 @@ func (s *AteomService) ReceiveLiveMigration(ctx context.Context, req *ateompb.Re
 	if err != nil {
 		return nil, fmt.Errorf("while building tap: %w", err)
 	}
-	defer func() {
-		for _, f := range tapFiles {
-			_ = f.Close()
-		}
-	}()
+	closeTapFiles(tapFiles)
 
 	apiSocket := filepath.Join(kata.VMDir(name), "clh-api-live-recv.sock")
 	var chCmd *exec.Cmd
@@ -188,8 +185,29 @@ func (s *AteomService) SendLiveMigration(ctx context.Context, req *ateompb.SendL
 	}
 
 	tStart := time.Now()
+	sender, err := newMigrationSender(req.GetDestinationUrl())
+	if err != nil {
+		return nil, err
+	}
+	listen := net.Listen
+	if sender.listenNetwork == "tcp" {
+		listen = func(network, address string) (net.Listener, error) {
+			var lis net.Listener
+			err := netNSDo(ctx, s.interiorNetNS, func(context.Context) error {
+				var listenErr error
+				lis, listenErr = net.Listen(network, address)
+				return listenErr
+			})
+			return lis, err
+		}
+	}
+	destinationURL, stopProxy, err := sender.startProxyWithListen(ctx, listen)
+	if err != nil {
+		return nil, err
+	}
+	defer stopProxy()
 	if err := client.SendMigration(ctx, ch.SendMigrationOptions{
-		DestinationURL:  req.GetDestinationUrl(),
+		DestinationURL:  destinationURL,
 		DowntimeMillis:  req.GetDowntimeMs(),
 		TimeoutSeconds:  req.GetTimeoutS(),
 		TimeoutStrategy: firstNonEmpty(req.GetTimeoutStrategy(), "Cancel"),

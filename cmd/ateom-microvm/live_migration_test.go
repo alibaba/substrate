@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -125,5 +126,96 @@ func TestMigrationReceiverProxyForwardsTCPToUnix(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("unix server did not finish")
+	}
+}
+
+func TestMigrationSenderForTCPUsesLoopbackProxy(t *testing.T) {
+	sender, err := newMigrationSender("tcp:10.0.0.2:19000")
+	if err != nil {
+		t.Fatalf("newMigrationSender: %v", err)
+	}
+	if sender.destinationAddress != "10.0.0.2:19000" {
+		t.Fatalf("destinationAddress=%q, want 10.0.0.2:19000", sender.destinationAddress)
+	}
+	if sender.listenNetwork != "tcp" || sender.listenAddress != "127.0.0.1:0" {
+		t.Fatalf("listen=(%q,%q), want tcp 127.0.0.1:0", sender.listenNetwork, sender.listenAddress)
+	}
+	if sender.chURL != "" {
+		t.Fatalf("chURL=%q before start, want empty", sender.chURL)
+	}
+}
+
+func TestMigrationSenderForUnixDoesNotNeedProxy(t *testing.T) {
+	sender, err := newMigrationSender("unix:/tmp/migrate.sock")
+	if err != nil {
+		t.Fatalf("newMigrationSender: %v", err)
+	}
+	if sender.chURL != "unix:/tmp/migrate.sock" {
+		t.Fatalf("chURL=%q, want original unix URL", sender.chURL)
+	}
+	if sender.listenAddress != "" || sender.destinationAddress != "" {
+		t.Fatalf("listenAddress=%q destinationAddress=%q, want no proxy", sender.listenAddress, sender.destinationAddress)
+	}
+}
+
+func TestMigrationSenderProxyForwardsTCPToTCP(t *testing.T) {
+	dstLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen destination tcp: %v", err)
+	}
+	defer dstLis.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := dstLis.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, len("ping"))
+		if _, err := conn.Read(buf); err != nil {
+			t.Errorf("destination read: %v", err)
+			return
+		}
+		if string(buf) != "ping" {
+			t.Errorf("destination read %q, want ping", string(buf))
+			return
+		}
+		if _, err := conn.Write([]byte("pong")); err != nil {
+			t.Errorf("destination write: %v", err)
+		}
+	}()
+
+	sender, err := newMigrationSender("tcp:" + dstLis.Addr().String())
+	if err != nil {
+		t.Fatalf("newMigrationSender: %v", err)
+	}
+	chURL, stop, err := sender.startProxy(context.Background())
+	if err != nil {
+		t.Fatalf("startProxy: %v", err)
+	}
+	defer stop()
+
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(chURL, "tcp:"), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial source proxy: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("proxy write: %v", err)
+	}
+	buf := make([]byte, len("pong"))
+	if _, err := conn.Read(buf); err != nil {
+		t.Fatalf("proxy read: %v", err)
+	}
+	if string(buf) != "pong" {
+		t.Fatalf("proxy read %q, want pong", string(buf))
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("destination server did not finish")
 	}
 }
