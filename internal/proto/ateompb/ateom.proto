@@ -45,6 +45,14 @@ service Ateom {
   // written by CheckpointWorkload.  Ateom will handle downloading the correct
   // gVisor / runsc version to match the checkpoint.
   rpc RestoreWorkload(RestoreWorkloadRequest) returns (RestoreWorkloadResponse) {}
+
+  // ReceiveLiveMigration prepares a destination microVM and blocks until Cloud
+  // Hypervisor receives an inbound live migration.
+  rpc ReceiveLiveMigration(ReceiveLiveMigrationRequest) returns (ReceiveLiveMigrationResponse) {}
+
+  // SendLiveMigration asks the currently running microVM to migrate to a
+  // prepared destination.
+  rpc SendLiveMigration(SendLiveMigrationRequest) returns (SendLiveMigrationResponse) {}
 }
 
 message RunWorkloadRequest {
@@ -169,4 +177,50 @@ message RestoreWorkloadRequest {
 }
 
 message RestoreWorkloadResponse {
+}
+
+message ReceiveLiveMigrationRequest {
+  string atespace = 1;
+  string actor_name = 2;
+
+  string actor_template_namespace = 3;
+  string actor_template_name = 4;
+
+  WorkloadSpec spec = 5;
+
+  // runtime_asset_paths maps a runtime asset name to the local on-disk path
+  // atelet fetched it to (see RunWorkloadRequest). Required for microVM live
+  // migration so the destination can start cloud-hypervisor and virtiofsd.
+  map<string, string> runtime_asset_paths = 6;
+
+  // Cloud Hypervisor migration receiver URL, for example
+  // "tcp:0.0.0.0:19000".
+  string receiver_url = 7;
+
+  // Cloud Hypervisor memory migration mode: "Precopy" or "Postcopy".
+  string memory_mode = 8;
+
+  // Optional TLS directory for TCP migration.
+  string tls_dir = 9;
+}
+
+message ReceiveLiveMigrationResponse {
+}
+
+message SendLiveMigrationRequest {
+  string actor_name = 1;
+
+  // Cloud Hypervisor migration destination URL, for example
+  // "tcp:10.0.0.2:19000".
+  string destination_url = 2;
+
+  int64 downtime_ms = 3;
+  int64 timeout_s = 4;
+  string timeout_strategy = 5;
+  int64 connections = 6;
+  string memory_mode = 7;
+  string tls_dir = 8;
+}
+
+message SendLiveMigrationResponse {
 }
