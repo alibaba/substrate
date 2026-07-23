@@ -21,6 +21,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -28,11 +29,11 @@ import (
 )
 
 const (
-	directProxyRetryBudget = 3 * time.Second
+	directProxyRetryBudget = 12 * time.Second
 	directProxyRetryDelay  = 50 * time.Millisecond
 	directProxyStaleHeader = "X-Substrate-Stale"
 
-	directProxyCachedAttemptTimeout = 250 * time.Millisecond
+	directProxyMigrationAttemptTimeout = 250 * time.Millisecond
 )
 
 type cachedDirectProxyResponse struct {
@@ -95,7 +96,7 @@ func (s *RouterServer) handleDirectProxy(w http.ResponseWriter, req *http.Reques
 	}
 
 	cacheKey := directProxyCacheKey(atespace, actorName, req)
-	if shouldServeCachedDirectProxyResponseBeforeUpstream(routeTarget.Phase) && s.writeCachedDirectProxyResponse(w, cacheKey) {
+	if directProxyStaleCacheEnabled() && shouldServeCachedDirectProxyResponseBeforeUpstream(routeTarget.Phase) && s.writeCachedDirectProxyResponse(w, cacheKey) {
 		return
 	}
 
@@ -109,7 +110,7 @@ func (s *RouterServer) handleDirectProxy(w http.ResponseWriter, req *http.Reques
 			slog.Any("err", err))
 		http.Error(w, "upstream actor request failed", http.StatusBadGateway)
 		return
-	} else if s.writeCachedDirectProxyResponse(w, cacheKey) {
+	} else if directProxyStaleCacheEnabled() && s.writeCachedDirectProxyResponse(w, cacheKey) {
 		return
 	}
 
@@ -129,7 +130,7 @@ func (s *RouterServer) handleDirectProxy(w http.ResponseWriter, req *http.Reques
 		}
 		if err := s.serveDirectProxyTarget(w, req, atespace, actorName, routeTarget); err != nil {
 			lastErr = err
-			if s.writeCachedDirectProxyResponse(w, cacheKey) {
+			if directProxyStaleCacheEnabled() && s.writeCachedDirectProxyResponse(w, cacheKey) {
 				return
 			}
 			continue
@@ -153,8 +154,8 @@ func (s *RouterServer) serveDirectProxyTarget(w http.ResponseWriter, req *http.R
 	out.URL.Host = targetHost
 	out.Host = targetHost
 	out.RequestURI = ""
-	if s.hasCachedDirectProxyResponse(cacheKey, req) {
-		attemptCtx, cancel := context.WithTimeout(req.Context(), directProxyCachedAttemptTimeout)
+	if shouldBoundDirectProxyAttempt(routeTarget.Phase) || (directProxyStaleCacheEnabled() && s.hasCachedDirectProxyResponse(cacheKey, req)) {
+		attemptCtx, cancel := context.WithTimeout(req.Context(), directProxyMigrationAttemptTimeout)
 		defer cancel()
 		out = out.WithContext(attemptCtx)
 	}
@@ -188,6 +189,10 @@ func (s *RouterServer) serveDirectProxyTarget(w http.ResponseWriter, req *http.R
 	}
 	s.storeCachedDirectProxyResponse(cacheKey, req, resp.StatusCode, resp.Header, body)
 	return nil
+}
+
+func directProxyStaleCacheEnabled() bool {
+	return os.Getenv("ATENET_DIRECT_PROXY_STALE_CACHE") == "1"
 }
 
 func copyHeader(dst, src http.Header) {
@@ -245,6 +250,15 @@ func (s *RouterServer) writeCachedDirectProxyResponse(w http.ResponseWriter, key
 }
 
 func shouldServeCachedDirectProxyResponseBeforeUpstream(phase ateapipb.ActorRoute_Phase) bool {
+	switch phase {
+	case ateapipb.ActorRoute_PHASE_DRAINING, ateapipb.ActorRoute_PHASE_SWITCHED:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldBoundDirectProxyAttempt(phase ateapipb.ActorRoute_Phase) bool {
 	switch phase {
 	case ateapipb.ActorRoute_PHASE_DRAINING, ateapipb.ActorRoute_PHASE_SWITCHED:
 		return true

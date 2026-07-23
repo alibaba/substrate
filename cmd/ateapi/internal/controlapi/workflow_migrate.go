@@ -422,10 +422,29 @@ func (w *ActorWorkflow) CommitActorMigration(ctx context.Context, atespace, name
 	recordMigrationStageDuration(actor, "commit_finalizing_update", time.Since(stageStart))
 
 	finalSnapshot := ""
+	routeSwitched := false
 	if migrationLiveCHEnabled() {
 		stageStart = time.Now()
-		if err := w.liveMigrateActor(ctx, actor, actorTemplate, source, target); err != nil {
+		var onTargetReady func() (*ateapipb.Actor, error)
+		if migrationLiveEarlyRouteSwitch() {
+			onTargetReady = func() (*ateapipb.Actor, error) {
+				stageStart := time.Now()
+				markMigrationSwitched(actor, finalSnapshot)
+				updated, err := w.store.UpdateActor(ctx, actor, actor.GetMetadata().GetVersion())
+				if err != nil {
+					return nil, err
+				}
+				recordMigrationStageDuration(updated, "commit_early_route_switch_update", time.Since(stageStart))
+				return updated, nil
+			}
+		}
+		earlyActor, err := w.liveMigrateActor(ctx, actor, actorTemplate, source, target, onTargetReady)
+		if err != nil {
 			return nil, err
+		}
+		if earlyActor != nil {
+			actor = earlyActor
+			routeSwitched = true
 		}
 		recordMigrationStageDuration(actor, "commit_live_migration", time.Since(stageStart))
 	} else if migrationCommitReusePreparedTarget() && actor.GetMigration().GetBaseSnapshotUriPrefix() != "" {
@@ -457,13 +476,15 @@ func (w *ActorWorkflow) CommitActorMigration(ctx context.Context, atespace, name
 			},
 		}
 	}
-	stageStart = time.Now()
-	markMigrationSwitched(actor, finalSnapshot)
-	actor, err = w.store.UpdateActor(ctx, actor, actor.GetMetadata().GetVersion())
-	if err != nil {
-		return nil, err
+	if !routeSwitched {
+		stageStart = time.Now()
+		markMigrationSwitched(actor, finalSnapshot)
+		actor, err = w.store.UpdateActor(ctx, actor, actor.GetMetadata().GetVersion())
+		if err != nil {
+			return nil, err
+		}
+		recordMigrationStageDuration(actor, "commit_route_switch_update", time.Since(stageStart))
 	}
-	recordMigrationStageDuration(actor, "commit_route_switch_update", time.Since(stageStart))
 
 	stageStart = time.Now()
 	if err := w.releaseMigrationSource(ctx, atespace, name, source); err != nil {
@@ -492,6 +513,10 @@ func migrationPrepareReserveOnly() bool {
 
 func migrationLiveCHEnabled() bool {
 	return os.Getenv("ATE_MIGRATION_LIVE_CH") == "1"
+}
+
+func migrationLiveEarlyRouteSwitch() bool {
+	return os.Getenv("ATE_MIGRATION_LIVE_EARLY_ROUTE_SWITCH") == "1"
 }
 
 func migrationCommitReusePreparedTarget() bool {
@@ -537,22 +562,22 @@ func intEnv(name string, def int) int {
 	return v
 }
 
-func (w *ActorWorkflow) liveMigrateActor(ctx context.Context, actor *ateapipb.Actor, actorTemplate *atev1alpha1.ActorTemplate, source, target *ateapipb.RouteTarget) error {
+func (w *ActorWorkflow) liveMigrateActor(ctx context.Context, actor *ateapipb.Actor, actorTemplate *atev1alpha1.ActorTemplate, source, target *ateapipb.RouteTarget, onTargetReady func() (*ateapipb.Actor, error)) (*ateapipb.Actor, error) {
 	workloadSpec, err := workloadSpecFromActorTemplateWithEnv(ctx, w.kubeClient, w.secretCache, actorTemplate)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sandboxAssets, err := resolveSandboxAssets(w.workerPoolLister, w.sandboxConfigLister, target.GetAteomPodNamespace(), target.GetWorkerPoolName())
 	if err != nil {
-		return fmt.Errorf("while resolving target sandbox assets: %w", err)
+		return nil, fmt.Errorf("while resolving target sandbox assets: %w", err)
 	}
 	targetConn, err := w.dialer.DialForWorker(target.GetAteomPodNamespace(), target.GetAteomPodName())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	sourceConn, err := w.dialer.DialForWorker(source.GetAteomPodNamespace(), source.GetAteomPodName())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	targetClient := ateletpb.NewAteomHerderClient(targetConn)
 	sourceClient := ateletpb.NewAteomHerderClient(sourceConn)
@@ -564,7 +589,11 @@ func (w *ActorWorkflow) liveMigrateActor(ctx context.Context, actor *ateapipb.Ac
 
 	migrationCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	receiveErrCh := make(chan error, 1)
+	type receiveResult struct {
+		actor *ateapipb.Actor
+		err   error
+	}
+	receiveCh := make(chan receiveResult, 1)
 	go func() {
 		_, err := targetClient.ReceiveLiveMigration(migrationCtx, &ateletpb.ReceiveLiveMigrationRequest{
 			TargetAteomUid:         target.GetAteomPodUid(),
@@ -577,20 +606,26 @@ func (w *ActorWorkflow) liveMigrateActor(ctx context.Context, actor *ateapipb.Ac
 			ReceiverUrl:            receiverURL,
 			MemoryMode:             memoryMode,
 		})
-		receiveErrCh <- err
+		var updated *ateapipb.Actor
+		if err == nil && onTargetReady != nil {
+			updated, err = onTargetReady()
+		}
+		receiveCh <- receiveResult{actor: updated, err: err}
 	}()
 
 	receiveDone := false
+	var receivedActor *ateapipb.Actor
 	if warmup := migrationLiveReceiverWarmup(); warmup > 0 {
 		select {
-		case err := <-receiveErrCh:
-			if err != nil {
-				return fmt.Errorf("while preparing live migration receiver: %w", err)
+		case result := <-receiveCh:
+			if result.err != nil {
+				return nil, fmt.Errorf("while preparing live migration receiver: %w", result.err)
 			}
+			receivedActor = result.actor
 			receiveDone = true
 		case <-time.After(warmup):
 		case <-migrationCtx.Done():
-			return migrationCtx.Err()
+			return nil, migrationCtx.Err()
 		}
 	}
 
@@ -613,20 +648,21 @@ func (w *ActorWorkflow) liveMigrateActor(ctx context.Context, actor *ateapipb.Ac
 		Connections:     migrationLiveConnections(),
 		MemoryMode:      memoryMode,
 	}); err != nil {
-		return fmt.Errorf("while sending live migration: %w", err)
+		return nil, fmt.Errorf("while sending live migration: %w", err)
 	}
 
 	if !receiveDone {
 		select {
-		case err := <-receiveErrCh:
-			if err != nil {
-				return fmt.Errorf("while receiving live migration: %w", err)
+		case result := <-receiveCh:
+			if result.err != nil {
+				return nil, fmt.Errorf("while receiving live migration: %w", result.err)
 			}
+			receivedActor = result.actor
 		case <-migrationCtx.Done():
-			return migrationCtx.Err()
+			return nil, migrationCtx.Err()
 		}
 	}
-	return nil
+	return receivedActor, nil
 }
 
 func (w *ActorWorkflow) checkpointMigrationSource(ctx context.Context, actor *ateapipb.Actor, actorTemplate *atev1alpha1.ActorTemplate, source *ateapipb.RouteTarget, snapshot string, requireQuiesce bool, preserveRunning bool) error {

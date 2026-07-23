@@ -130,6 +130,8 @@ func TestDirectProxyDoesNotRetryNonIdempotentRequest(t *testing.T) {
 }
 
 func TestDirectProxyServesStaleCachedGETAfterUpstreamFailure(t *testing.T) {
+	t.Setenv("ATENET_DIRECT_PROXY_STALE_CACHE", "1")
+
 	client := &routeResolverMockClient{
 		getRouteFn: func(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error) {
 			return &ateapipb.GetActorRouteResponse{
@@ -187,6 +189,8 @@ func TestDirectProxyServesStaleCachedGETAfterUpstreamFailure(t *testing.T) {
 }
 
 func TestDirectProxyServesStaleCachedGETBeforeUpstreamDuringDrain(t *testing.T) {
+	t.Setenv("ATENET_DIRECT_PROXY_STALE_CACHE", "1")
+
 	var routeCalls atomic.Int32
 	var upstreamCalls atomic.Int32
 	client := &routeResolverMockClient{
@@ -249,6 +253,8 @@ func TestDirectProxyServesStaleCachedGETBeforeUpstreamDuringDrain(t *testing.T) 
 }
 
 func TestDirectProxyServesStaleCachedGETWhenUpstreamStalls(t *testing.T) {
+	t.Setenv("ATENET_DIRECT_PROXY_STALE_CACHE", "1")
+
 	client := &routeResolverMockClient{
 		getRouteFn: func(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error) {
 			return &ateapipb.GetActorRouteResponse{
@@ -309,6 +315,8 @@ func TestDirectProxyServesStaleCachedGETWhenUpstreamStalls(t *testing.T) {
 }
 
 func TestDirectProxyServesStaleCachedGETWhenUpstreamBodyStalls(t *testing.T) {
+	t.Setenv("ATENET_DIRECT_PROXY_STALE_CACHE", "1")
+
 	client := &routeResolverMockClient{
 		getRouteFn: func(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error) {
 			return &ateapipb.GetActorRouteResponse{
@@ -364,6 +372,127 @@ func TestDirectProxyServesStaleCachedGETWhenUpstreamBodyStalls(t *testing.T) {
 	}
 	if second.Header().Get("X-Substrate-Stale") != "true" {
 		t.Fatalf("X-Substrate-Stale = %q, want true", second.Header().Get("X-Substrate-Stale"))
+	}
+}
+
+func TestDirectProxyDoesNotServeStaleCachedGETByDefault(t *testing.T) {
+	client := &routeResolverMockClient{
+		getRouteFn: func(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error) {
+			return &ateapipb.GetActorRouteResponse{
+				Actor: &ateapipb.Actor{
+					Status: ateapipb.Actor_STATUS_RUNNING,
+					Route: &ateapipb.ActorRoute{
+						Active:     &ateapipb.RouteTarget{AteomPodIp: "10.0.0.1"},
+						Phase:      ateapipb.ActorRoute_PHASE_ACTIVE,
+						Generation: 1,
+					},
+				},
+			}, nil
+		},
+	}
+	var upstreamCalls atomic.Int32
+	resolver := NewActorRouteResolver(client, NewActorResumer(client))
+	srv := &RouterServer{
+		extprocSrv: &ExtProcServer{routeResolver: resolver},
+		inflight:   newInFlightTracker(),
+		directProxyTransport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if upstreamCalls.Add(1) == 1 {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader("cached")),
+					Request:    req,
+				}, nil
+			}
+			return nil, fmt.Errorf("source paused")
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://my-actor.team-a.actors.resources.substrate.ate.dev/substrate/migration-state", nil)
+	req.Host = "my-actor.team-a.actors.resources.substrate.ate.dev"
+	first := httptest.NewRecorder()
+	srv.handleDirectProxy(first, req)
+	if first.Code != http.StatusOK || first.Body.String() != "cached" {
+		t.Fatalf("first response = %d %q, want 200 cached", first.Code, first.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "http://my-actor.team-a.actors.resources.substrate.ate.dev/substrate/migration-state", nil)
+	req.Host = "my-actor.team-a.actors.resources.substrate.ate.dev"
+	second := httptest.NewRecorder()
+	srv.handleDirectProxy(second, req)
+
+	if second.Code != http.StatusBadGateway {
+		t.Fatalf("second status = %d body=%q, want 502 without stale cache", second.Code, second.Body.String())
+	}
+	if second.Header().Get("X-Substrate-Stale") != "" {
+		t.Fatalf("X-Substrate-Stale = %q, want empty", second.Header().Get("X-Substrate-Stale"))
+	}
+}
+
+func TestDirectProxyBoundsMigrationAttemptAndRetriesSwitchedTarget(t *testing.T) {
+	var routeCalls atomic.Int32
+	client := &routeResolverMockClient{
+		getRouteFn: func(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error) {
+			call := routeCalls.Add(1)
+			ip := "10.0.0.1"
+			phase := ateapipb.ActorRoute_PHASE_DRAINING
+			gen := int64(1)
+			if call > 2 {
+				ip = "10.0.0.2"
+				phase = ateapipb.ActorRoute_PHASE_SWITCHED
+				gen = 2
+			}
+			return &ateapipb.GetActorRouteResponse{
+				Actor: &ateapipb.Actor{
+					Status: ateapipb.Actor_STATUS_RUNNING,
+					Route: &ateapipb.ActorRoute{
+						Active:     &ateapipb.RouteTarget{AteomPodIp: ip},
+						Phase:      phase,
+						Generation: gen,
+					},
+				},
+			}, nil
+		},
+	}
+	resolver := NewActorRouteResolver(client, NewActorResumer(client))
+	srv := &RouterServer{
+		extprocSrv: &ExtProcServer{routeResolver: resolver},
+		inflight:   newInFlightTracker(),
+		directProxyTransport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Host == "10.0.0.1:80" {
+				<-req.Context().Done()
+				return nil, req.Context().Err()
+			}
+			if req.URL.Host != "10.0.0.2:80" {
+				t.Fatalf("unexpected upstream host %q", req.URL.Host)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("target")),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://my-actor.team-a.actors.resources.substrate.ate.dev/substrate/migration-state", nil)
+	req.Host = "my-actor.team-a.actors.resources.substrate.ate.dev"
+	rec := httptest.NewRecorder()
+	start := time.Now()
+	srv.handleDirectProxy(rec, req)
+	elapsed := time.Since(start)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%q, want 200", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != "target" {
+		t.Fatalf("body = %q, want target", rec.Body.String())
+	}
+	if rec.Header().Get("X-Substrate-Stale") != "" {
+		t.Fatalf("X-Substrate-Stale = %q, want empty", rec.Header().Get("X-Substrate-Stale"))
+	}
+	if elapsed > time.Second {
+		t.Fatalf("retry took %s, want under 1s", elapsed)
 	}
 }
 
