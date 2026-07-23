@@ -101,6 +101,40 @@ func (c *Client) Snapshot(ctx context.Context, destDir string) error {
 	return c.api.put(ctx, "/api/v1/vm.snapshot", snapshotConfig{DestinationURL: SnapshotURL(destDir)})
 }
 
+// ReceiveMigration prepares this VMM to receive an inbound Cloud Hypervisor live
+// migration. The VMM must be a bare VMM with no VM created yet.
+func (c *Client) ReceiveMigration(ctx context.Context, opts ReceiveMigrationOptions) error {
+	if opts.ReceiverURL == "" {
+		return fmt.Errorf("receiver URL is required")
+	}
+	cfg := receiveMigrationConfig{
+		ReceiverURL: opts.ReceiverURL,
+		TLSDir:      opts.TLSDir,
+		MemoryMode:  opts.MemoryMode,
+	}
+	return c.api.put(ctx, "/api/v1/vm.receive-migration", cfg)
+}
+
+// SendMigration starts a Cloud Hypervisor live migration from this running VM
+// to a receiver URL. On success, Cloud Hypervisor terminates the source VM and
+// the destination VM continues running.
+func (c *Client) SendMigration(ctx context.Context, opts SendMigrationOptions) error {
+	if opts.DestinationURL == "" {
+		return fmt.Errorf("destination URL is required")
+	}
+	cfg := sendMigrationConfig{
+		DestinationURL:  opts.DestinationURL,
+		Local:           opts.Local,
+		DowntimeMillis:  opts.DowntimeMillis,
+		TimeoutSeconds:  opts.TimeoutSeconds,
+		TimeoutStrategy: opts.TimeoutStrategy,
+		Connections:     opts.Connections,
+		TLSDir:          opts.TLSDir,
+		MemoryMode:      opts.MemoryMode,
+	}
+	return c.api.put(ctx, "/api/v1/vm.send-migration", cfg)
+}
+
 // Shutdown best-effort tears down the VM and the VMM process behind the socket.
 func (c *Client) Shutdown(ctx context.Context) error {
 	_ = c.api.put(ctx, "/api/v1/vm.shutdown", nil)
@@ -110,3 +144,22 @@ func (c *Client) Shutdown(ctx context.Context) error {
 // SnapshotURL returns the file:// URL cloud-hypervisor expects for a snapshot
 // destination or restore source directory.
 func SnapshotURL(dir string) string { return "file://" + dir }
+
+// ReceiveMigrationOptions maps to Cloud Hypervisor ReceiveMigrationData.
+type ReceiveMigrationOptions struct {
+	ReceiverURL string
+	TLSDir      string
+	MemoryMode  string
+}
+
+// SendMigrationOptions maps to Cloud Hypervisor SendMigrationData.
+type SendMigrationOptions struct {
+	DestinationURL  string
+	Local           bool
+	DowntimeMillis  int64
+	TimeoutSeconds  int64
+	TimeoutStrategy string
+	Connections     int64
+	TLSDir          string
+	MemoryMode      string
+}

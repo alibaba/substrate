@@ -132,6 +132,66 @@ func TestClientLifecycleCalls(t *testing.T) {
 	}
 }
 
+func TestClientMigrationCalls(t *testing.T) {
+	client, fake := startFakeCH(t)
+	ctx := context.Background()
+
+	if err := client.ReceiveMigration(ctx, ReceiveMigrationOptions{
+		ReceiverURL: "tcp:0.0.0.0:19000",
+		TLSDir:      "/tls/dst",
+		MemoryMode:  "Precopy",
+	}); err != nil {
+		t.Fatalf("ReceiveMigration: %v", err)
+	}
+	if err := client.SendMigration(ctx, SendMigrationOptions{
+		DestinationURL:  "tcp:10.0.0.2:19000",
+		DowntimeMillis:  200,
+		TimeoutSeconds:  300,
+		TimeoutStrategy: "Cancel",
+		Connections:     8,
+		TLSDir:          "/tls/src",
+		MemoryMode:      "Precopy",
+	}); err != nil {
+		t.Fatalf("SendMigration: %v", err)
+	}
+
+	reqs := fake.recorded()
+	want := []recordedReq{
+		{method: http.MethodPut, path: "/api/v1/vm.receive-migration"},
+		{method: http.MethodPut, path: "/api/v1/vm.send-migration"},
+	}
+	if len(reqs) != len(want) {
+		t.Fatalf("got %d requests %+v, want %d", len(reqs), reqs, len(want))
+	}
+	for i := range want {
+		if reqs[i].method != want[i].method || reqs[i].path != want[i].path {
+			t.Fatalf("request %d = %s %s, want %s %s", i, reqs[i].method, reqs[i].path, want[i].method, want[i].path)
+		}
+	}
+
+	var recv receiveMigrationConfig
+	if err := json.Unmarshal([]byte(reqs[0].body), &recv); err != nil {
+		t.Fatalf("receive migration body not JSON: %v (%q)", err, reqs[0].body)
+	}
+	if recv.ReceiverURL != "tcp:0.0.0.0:19000" || recv.TLSDir != "/tls/dst" || recv.MemoryMode != "Precopy" {
+		t.Fatalf("receive migration body = %+v, want receiver/tls/memory mode", recv)
+	}
+
+	var send sendMigrationConfig
+	if err := json.Unmarshal([]byte(reqs[1].body), &send); err != nil {
+		t.Fatalf("send migration body not JSON: %v (%q)", err, reqs[1].body)
+	}
+	if send.DestinationURL != "tcp:10.0.0.2:19000" ||
+		send.DowntimeMillis != 200 ||
+		send.TimeoutSeconds != 300 ||
+		send.TimeoutStrategy != "Cancel" ||
+		send.Connections != 8 ||
+		send.TLSDir != "/tls/src" ||
+		send.MemoryMode != "Precopy" {
+		t.Fatalf("send migration body = %+v, want configured migration options", send)
+	}
+}
+
 func TestWaitReadyTimesOut(t *testing.T) {
 	// Socket that never exists -> WaitReady should time out, not hang.
 	client := NewClient(filepath.Join(t.TempDir(), "nonexistent.sock"))

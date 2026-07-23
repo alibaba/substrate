@@ -128,3 +128,20 @@ func (c *apiClient) put(ctx context.Context, path string, body any) error {
 type snapshotConfig struct {
 	DestinationURL string `json:"destination_url"`
 }
+
+type receiveMigrationConfig struct {
+	ReceiverURL string `json:"receiver_url"`
+	TLSDir      string `json:"tls_dir,omitempty"`
+	MemoryMode  string `json:"memory_mode,omitempty"`
+}
+
+type sendMigrationConfig struct {
+	DestinationURL  string `json:"destination_url"`
+	Local           bool   `json:"local,omitempty"`
+	DowntimeMillis  int64  `json:"downtime_ms,omitempty"`
+	TimeoutSeconds  int64  `json:"timeout_s,omitempty"`
+	TimeoutStrategy string `json:"timeout_strategy,omitempty"`
+	Connections     int64  `json:"connections,omitempty"`
+	TLSDir          string `json:"tls_dir,omitempty"`
+	MemoryMode      string `json:"memory_mode,omitempty"`
+}
