@@ -172,6 +172,13 @@ type FakeAteletServer struct {
 	RestoreRequests []*ateletpb.RestoreRequest
 	FailRestore     error
 	RestoreDelay    time.Duration
+
+	ReceiveLiveMigrationCalled   bool
+	ReceiveLiveMigrationRequest  *ateletpb.ReceiveLiveMigrationRequest
+	ReceiveLiveMigrationRequests []*ateletpb.ReceiveLiveMigrationRequest
+	SendLiveMigrationCalled      bool
+	SendLiveMigrationRequest     *ateletpb.SendLiveMigrationRequest
+	SendLiveMigrationRequests    []*ateletpb.SendLiveMigrationRequest
 }
 
 func (f *FakeAteletServer) Reset() {
@@ -191,6 +198,13 @@ func (f *FakeAteletServer) Reset() {
 	f.RestoreRequests = nil
 	f.FailRestore = nil
 	f.RestoreDelay = 0
+
+	f.ReceiveLiveMigrationCalled = false
+	f.ReceiveLiveMigrationRequest = nil
+	f.ReceiveLiveMigrationRequests = nil
+	f.SendLiveMigrationCalled = false
+	f.SendLiveMigrationRequest = nil
+	f.SendLiveMigrationRequests = nil
 }
 
 func (f *FakeAteletServer) Run(ctx context.Context, req *ateletpb.RunRequest) (*ateletpb.RunResponse, error) {
@@ -233,6 +247,26 @@ func (f *FakeAteletServer) Restore(ctx context.Context, req *ateletpb.RestoreReq
 	return &ateletpb.RestoreResponse{}, nil
 }
 
+func (f *FakeAteletServer) ReceiveLiveMigration(ctx context.Context, req *ateletpb.ReceiveLiveMigrationRequest) (*ateletpb.ReceiveLiveMigrationResponse, error) {
+	f.Lock.Lock()
+	defer f.Lock.Unlock()
+
+	f.ReceiveLiveMigrationCalled = true
+	f.ReceiveLiveMigrationRequest = proto.Clone(req).(*ateletpb.ReceiveLiveMigrationRequest)
+	f.ReceiveLiveMigrationRequests = append(f.ReceiveLiveMigrationRequests, proto.Clone(req).(*ateletpb.ReceiveLiveMigrationRequest))
+	return &ateletpb.ReceiveLiveMigrationResponse{}, nil
+}
+
+func (f *FakeAteletServer) SendLiveMigration(ctx context.Context, req *ateletpb.SendLiveMigrationRequest) (*ateletpb.SendLiveMigrationResponse, error) {
+	f.Lock.Lock()
+	defer f.Lock.Unlock()
+
+	f.SendLiveMigrationCalled = true
+	f.SendLiveMigrationRequest = proto.Clone(req).(*ateletpb.SendLiveMigrationRequest)
+	f.SendLiveMigrationRequests = append(f.SendLiveMigrationRequests, proto.Clone(req).(*ateletpb.SendLiveMigrationRequest))
+	return &ateletpb.SendLiveMigrationResponse{}, nil
+}
+
 func (f *FakeAteletServer) lastRestoreRequest() *ateletpb.RestoreRequest {
 	f.Lock.Lock()
 	defer f.Lock.Unlock()
@@ -261,6 +295,28 @@ func (f *FakeAteletServer) restoreRequests() []*ateletpb.RestoreRequest {
 	out := make([]*ateletpb.RestoreRequest, 0, len(f.RestoreRequests))
 	for _, req := range f.RestoreRequests {
 		out = append(out, proto.Clone(req).(*ateletpb.RestoreRequest))
+	}
+	return out
+}
+
+func (f *FakeAteletServer) receiveLiveMigrationRequests() []*ateletpb.ReceiveLiveMigrationRequest {
+	f.Lock.Lock()
+	defer f.Lock.Unlock()
+
+	out := make([]*ateletpb.ReceiveLiveMigrationRequest, 0, len(f.ReceiveLiveMigrationRequests))
+	for _, req := range f.ReceiveLiveMigrationRequests {
+		out = append(out, proto.Clone(req).(*ateletpb.ReceiveLiveMigrationRequest))
+	}
+	return out
+}
+
+func (f *FakeAteletServer) sendLiveMigrationRequests() []*ateletpb.SendLiveMigrationRequest {
+	f.Lock.Lock()
+	defer f.Lock.Unlock()
+
+	out := make([]*ateletpb.SendLiveMigrationRequest, 0, len(f.SendLiveMigrationRequests))
+	for _, req := range f.SendLiveMigrationRequests {
+		out = append(out, proto.Clone(req).(*ateletpb.SendLiveMigrationRequest))
 	}
 	return out
 }
@@ -1711,6 +1767,111 @@ func TestCommitActorMigrationCanReusePreparedTarget(t *testing.T) {
 	}
 	if got := actor.GetMigration().GetStageDurationMs()["commit_reuse_prepared_target"]; got != 0 {
 		t.Fatalf("commit_reuse_prepared_target duration = %d, want 0", got)
+	}
+}
+
+func TestCommitActorMigrationUsesCloudHypervisorLiveMigration(t *testing.T) {
+	t.Setenv("ATE_MIGRATION_LIVE_CH", "1")
+	t.Setenv("ATE_MIGRATION_LIVE_RECEIVER_WARMUP_MS", "0")
+	t.Setenv("ATE_MIGRATION_LIVE_PORT", "19123")
+	t.Setenv("ATE_MIGRATION_LIVE_DOWNTIME_MS", "150")
+	t.Setenv("ATE_MIGRATION_LIVE_CONNECTIONS", "8")
+
+	ns := namespaceForTest("ns-commit-migration-live")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createAteletPod(t, tc, "atelet-node2-live-"+strings.ToLower(ns[:min(len(ns), 8)]), "node2")
+	createWorkerPod(t, tc, ns, "worker-source", "node1", "pool1")
+	createWorkerPod(t, tc, ns, "worker-target", "node2", "pool1")
+
+	name := "id1"
+	if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+		Metadata:               &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+		ActorTemplateNamespace: ns,
+		ActorTemplateName:      "tmpl1",
+	}}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+	}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+	tc.fakeAtelet.Reset()
+
+	prepareResp, err := tc.client.PrepareActorMigration(context.Background(), &ateapipb.PrepareActorMigrationRequest{
+		Actor:            &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		RequireCrossNode: true,
+	})
+	if err != nil {
+		t.Fatalf("PrepareActorMigration failed: %v", err)
+	}
+	if got := prepareResp.GetActor().GetMigration().GetBaseSnapshotUriPrefix(); got != "" {
+		t.Fatalf("live prepare base snapshot = %q, want empty", got)
+	}
+	if checkpoints := tc.fakeAtelet.checkpointRequests(); len(checkpoints) != 0 {
+		t.Fatalf("expected no prepare Checkpoint for live migration, got %d", len(checkpoints))
+	}
+	if restores := tc.fakeAtelet.restoreRequests(); len(restores) != 0 {
+		t.Fatalf("expected no prepare Restore for live migration, got %d", len(restores))
+	}
+	tc.fakeAtelet.Reset()
+
+	commitResp, err := tc.client.CommitActorMigration(context.Background(), &ateapipb.CommitActorMigrationRequest{
+		Actor:          &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		DrainTimeoutMs: 3000,
+	})
+	if err != nil {
+		t.Fatalf("CommitActorMigration failed: %v", err)
+	}
+	actor := commitResp.GetActor()
+	if got := actor.GetRoute().GetActive().GetAteomPodName(); got != "worker-target" {
+		t.Fatalf("expected route.active worker-target, got %q", got)
+	}
+	if got := actor.GetMigration().GetFinalSnapshotUriPrefix(); got != "" {
+		t.Fatalf("live migration final snapshot = %q, want empty", got)
+	}
+	if checkpoints := tc.fakeAtelet.checkpointRequests(); len(checkpoints) != 0 {
+		t.Fatalf("expected no commit Checkpoint for live migration, got %d", len(checkpoints))
+	}
+	if restores := tc.fakeAtelet.restoreRequests(); len(restores) != 0 {
+		t.Fatalf("expected no commit Restore for live migration, got %d", len(restores))
+	}
+
+	receives := tc.fakeAtelet.receiveLiveMigrationRequests()
+	if len(receives) != 1 {
+		t.Fatalf("expected one ReceiveLiveMigration, got %d", len(receives))
+	}
+	if got := receives[0].GetTargetAteomUid(); got != actor.GetMigration().GetTarget().GetAteomPodUid() {
+		t.Fatalf("receive target uid = %q, want target worker uid", got)
+	}
+	if got := receives[0].GetReceiverUrl(); got != "tcp:0.0.0.0:19123" {
+		t.Fatalf("receiver_url = %q, want tcp:0.0.0.0:19123", got)
+	}
+	if got := receives[0].GetMemoryMode(); got != "Precopy" {
+		t.Fatalf("receive memory_mode = %q, want Precopy", got)
+	}
+
+	sends := tc.fakeAtelet.sendLiveMigrationRequests()
+	if len(sends) != 1 {
+		t.Fatalf("expected one SendLiveMigration, got %d", len(sends))
+	}
+	if got := sends[0].GetTargetAteomUid(); got != actor.GetMigration().GetSource().GetAteomPodUid() {
+		t.Fatalf("send target uid = %q, want source worker uid", got)
+	}
+	if got := sends[0].GetDestinationUrl(); got != "tcp:127.0.0.1:19123" {
+		t.Fatalf("destination_url = %q, want tcp:127.0.0.1:19123", got)
+	}
+	if got := sends[0].GetDowntimeMs(); got != 150 {
+		t.Fatalf("downtime_ms = %d, want 150", got)
+	}
+	if got := sends[0].GetConnections(); got != 8 {
+		t.Fatalf("connections = %d, want 8", got)
+	}
+	if got := actor.GetMigration().GetStageDurationMs()["commit_live_migration"]; got < 0 {
+		t.Fatalf("commit_live_migration duration = %d, want non-negative", got)
 	}
 }
 

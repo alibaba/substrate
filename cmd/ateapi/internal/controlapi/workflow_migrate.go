@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -177,7 +178,7 @@ func (w *ActorWorkflow) PrepareActorMigration(ctx context.Context, atespace, nam
 	}
 
 	baseSnapshot := ""
-	reserveOnly := migrationPrepareReserveOnly()
+	reserveOnly := migrationPrepareReserveOnly() || migrationLiveCHEnabled()
 	var prepareSourceCheckpoint time.Duration
 	if !reserveOnly {
 		baseSnapshot = migrationFinalSnapshot(actor, actorTemplate)
@@ -420,8 +421,14 @@ func (w *ActorWorkflow) CommitActorMigration(ctx context.Context, atespace, name
 	}
 	recordMigrationStageDuration(actor, "commit_finalizing_update", time.Since(stageStart))
 
-	finalSnapshot := migrationFinalSnapshot(actor, actorTemplate)
-	if migrationCommitReusePreparedTarget() && actor.GetMigration().GetBaseSnapshotUriPrefix() != "" {
+	finalSnapshot := ""
+	if migrationLiveCHEnabled() {
+		stageStart = time.Now()
+		if err := w.liveMigrateActor(ctx, actor, actorTemplate, source, target); err != nil {
+			return nil, err
+		}
+		recordMigrationStageDuration(actor, "commit_live_migration", time.Since(stageStart))
+	} else if migrationCommitReusePreparedTarget() && actor.GetMigration().GetBaseSnapshotUriPrefix() != "" {
 		finalSnapshot = actor.GetMigration().GetBaseSnapshotUriPrefix()
 		recordMigrationStageDuration(actor, "commit_reuse_prepared_target", 0)
 		slog.InfoContext(ctx, "Reusing prepared migration target without final checkpoint",
@@ -431,6 +438,7 @@ func (w *ActorWorkflow) CommitActorMigration(ctx context.Context, atespace, name
 			slog.String("target_node", target.GetNodeName()),
 			slog.String("snapshot", finalSnapshot))
 	} else {
+		finalSnapshot = migrationFinalSnapshot(actor, actorTemplate)
 		stageStart = time.Now()
 		if err := w.checkpointMigrationSource(ctx, actor, actorTemplate, source, finalSnapshot, requireQuiesce, false); err != nil {
 			return nil, err
@@ -442,10 +450,12 @@ func (w *ActorWorkflow) CommitActorMigration(ctx context.Context, atespace, name
 		}
 		recordMigrationStageDuration(actor, "commit_target_restore", time.Since(stageStart))
 	}
-	actor.LatestSnapshotInfo = &ateapipb.SnapshotInfo{
-		Data: &ateapipb.SnapshotInfo_External{
-			External: &ateapipb.ExternalSnapshotInfo{SnapshotUriPrefix: finalSnapshot},
-		},
+	if finalSnapshot != "" {
+		actor.LatestSnapshotInfo = &ateapipb.SnapshotInfo{
+			Data: &ateapipb.SnapshotInfo_External{
+				External: &ateapipb.ExternalSnapshotInfo{SnapshotUriPrefix: finalSnapshot},
+			},
+		}
 	}
 	stageStart = time.Now()
 	markMigrationSwitched(actor, finalSnapshot)
@@ -480,8 +490,143 @@ func migrationPrepareReserveOnly() bool {
 	return os.Getenv("ATE_MIGRATION_PREPARE_RESERVE_ONLY") == "1"
 }
 
+func migrationLiveCHEnabled() bool {
+	return os.Getenv("ATE_MIGRATION_LIVE_CH") == "1"
+}
+
 func migrationCommitReusePreparedTarget() bool {
 	return os.Getenv("ATE_MIGRATION_COMMIT_REUSE_PREPARED_TARGET") == "1"
+}
+
+func migrationLiveReceiverPort() int {
+	return intEnv("ATE_MIGRATION_LIVE_PORT", 19000)
+}
+
+func migrationLiveReceiverWarmup() time.Duration {
+	return time.Duration(intEnv("ATE_MIGRATION_LIVE_RECEIVER_WARMUP_MS", 500)) * time.Millisecond
+}
+
+func migrationLiveDowntimeMs() int64 {
+	return int64(intEnv("ATE_MIGRATION_LIVE_DOWNTIME_MS", 200))
+}
+
+func migrationLiveTimeoutS() int64 {
+	return int64(intEnv("ATE_MIGRATION_LIVE_TIMEOUT_S", 120))
+}
+
+func migrationLiveConnections() int64 {
+	return int64(intEnv("ATE_MIGRATION_LIVE_CONNECTIONS", 4))
+}
+
+func migrationLiveMemoryMode() string {
+	if v := os.Getenv("ATE_MIGRATION_LIVE_MEMORY_MODE"); v != "" {
+		return v
+	}
+	return "Precopy"
+}
+
+func intEnv(name string, def int) int {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+func (w *ActorWorkflow) liveMigrateActor(ctx context.Context, actor *ateapipb.Actor, actorTemplate *atev1alpha1.ActorTemplate, source, target *ateapipb.RouteTarget) error {
+	workloadSpec, err := workloadSpecFromActorTemplateWithEnv(ctx, w.kubeClient, w.secretCache, actorTemplate)
+	if err != nil {
+		return err
+	}
+	sandboxAssets, err := resolveSandboxAssets(w.workerPoolLister, w.sandboxConfigLister, target.GetAteomPodNamespace(), target.GetWorkerPoolName())
+	if err != nil {
+		return fmt.Errorf("while resolving target sandbox assets: %w", err)
+	}
+	targetConn, err := w.dialer.DialForWorker(target.GetAteomPodNamespace(), target.GetAteomPodName())
+	if err != nil {
+		return err
+	}
+	sourceConn, err := w.dialer.DialForWorker(source.GetAteomPodNamespace(), source.GetAteomPodName())
+	if err != nil {
+		return err
+	}
+	targetClient := ateletpb.NewAteomHerderClient(targetConn)
+	sourceClient := ateletpb.NewAteomHerderClient(sourceConn)
+
+	port := migrationLiveReceiverPort()
+	receiverURL := fmt.Sprintf("tcp:0.0.0.0:%d", port)
+	destinationURL := fmt.Sprintf("tcp:%s:%d", target.GetAteomPodIp(), port)
+	memoryMode := migrationLiveMemoryMode()
+
+	migrationCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	receiveErrCh := make(chan error, 1)
+	go func() {
+		_, err := targetClient.ReceiveLiveMigration(migrationCtx, &ateletpb.ReceiveLiveMigrationRequest{
+			TargetAteomUid:         target.GetAteomPodUid(),
+			Atespace:               actor.GetMetadata().GetAtespace(),
+			ActorName:              actor.GetMetadata().GetName(),
+			ActorTemplateNamespace: actor.GetActorTemplateNamespace(),
+			ActorTemplateName:      actor.GetActorTemplateName(),
+			Spec:                   workloadSpec,
+			SandboxAssets:          sandboxAssets,
+			ReceiverUrl:            receiverURL,
+			MemoryMode:             memoryMode,
+		})
+		receiveErrCh <- err
+	}()
+
+	receiveDone := false
+	if warmup := migrationLiveReceiverWarmup(); warmup > 0 {
+		select {
+		case err := <-receiveErrCh:
+			if err != nil {
+				return fmt.Errorf("while preparing live migration receiver: %w", err)
+			}
+			receiveDone = true
+		case <-time.After(warmup):
+		case <-migrationCtx.Done():
+			return migrationCtx.Err()
+		}
+	}
+
+	slog.InfoContext(ctx, "Sending Cloud Hypervisor live migration",
+		slog.String("atespace", actor.GetMetadata().GetAtespace()),
+		slog.String("actor", actor.GetMetadata().GetName()),
+		slog.String("source_worker", source.GetAteomPodName()),
+		slog.String("target_worker", target.GetAteomPodName()),
+		slog.String("destination_url", destinationURL),
+		slog.Int64("downtime_ms", migrationLiveDowntimeMs()),
+		slog.Int64("connections", migrationLiveConnections()),
+		slog.String("memory_mode", memoryMode))
+	if _, err := sourceClient.SendLiveMigration(migrationCtx, &ateletpb.SendLiveMigrationRequest{
+		TargetAteomUid:  source.GetAteomPodUid(),
+		ActorName:       actor.GetMetadata().GetName(),
+		DestinationUrl:  destinationURL,
+		DowntimeMs:      migrationLiveDowntimeMs(),
+		TimeoutS:        migrationLiveTimeoutS(),
+		TimeoutStrategy: "Cancel",
+		Connections:     migrationLiveConnections(),
+		MemoryMode:      memoryMode,
+	}); err != nil {
+		return fmt.Errorf("while sending live migration: %w", err)
+	}
+
+	if !receiveDone {
+		select {
+		case err := <-receiveErrCh:
+			if err != nil {
+				return fmt.Errorf("while receiving live migration: %w", err)
+			}
+		case <-migrationCtx.Done():
+			return migrationCtx.Err()
+		}
+	}
+	return nil
 }
 
 func (w *ActorWorkflow) checkpointMigrationSource(ctx context.Context, actor *ateapipb.Actor, actorTemplate *atev1alpha1.ActorTemplate, source *ateapipb.RouteTarget, snapshot string, requireQuiesce bool, preserveRunning bool) error {
