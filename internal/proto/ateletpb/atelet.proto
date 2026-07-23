@@ -30,6 +30,14 @@ service AteomHerder {
 
   // Restore restores a workload from checkpoint onto an ateom.
   rpc Restore(RestoreRequest) returns (RestoreResponse) {}
+
+  // ReceiveLiveMigration prepares an ateom as a Cloud Hypervisor live migration
+  // destination and blocks until the migration is received.
+  rpc ReceiveLiveMigration(ReceiveLiveMigrationRequest) returns (ReceiveLiveMigrationResponse) {}
+
+  // SendLiveMigration asks a running ateom workload to migrate to a prepared
+  // Cloud Hypervisor destination.
+  rpc SendLiveMigration(SendLiveMigrationRequest) returns (SendLiveMigrationResponse) {}
 }
 
 message RunRequest {
@@ -238,4 +246,40 @@ message RestoreRequest {
 }
 
 message RestoreResponse {
+}
+
+message ReceiveLiveMigrationRequest {
+  string target_ateom_uid = 1;
+
+  string atespace = 2;
+  string actor_name = 3;
+
+  string actor_template_namespace = 4;
+  string actor_template_name = 5;
+
+  WorkloadSpec spec = 6;
+  SandboxAssets sandbox_assets = 7;
+
+  string receiver_url = 8;
+  string memory_mode = 9;
+  string tls_dir = 10;
+}
+
+message ReceiveLiveMigrationResponse {
+}
+
+message SendLiveMigrationRequest {
+  string target_ateom_uid = 1;
+  string actor_name = 2;
+
+  string destination_url = 3;
+  int64 downtime_ms = 4;
+  int64 timeout_s = 5;
+  string timeout_strategy = 6;
+  int64 connections = 7;
+  string memory_mode = 8;
+  string tls_dir = 9;
+}
+
+message SendLiveMigrationResponse {
 }

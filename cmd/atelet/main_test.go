@@ -786,6 +786,21 @@ func TestRPCBoundariesReject(t *testing.T) {
 		})
 		wantInvalidArgument(t, "Restore", err)
 	})
+	t.Run("ReceiveLiveMigration", func(t *testing.T) {
+		_, err := s.ReceiveLiveMigration(ctx, &ateletpb.ReceiveLiveMigrationRequest{
+			Atespace: okAtespace, ActorName: okID,
+			TargetAteomUid: badUID, Spec: okSpec,
+			ReceiverUrl: "tcp:0.0.0.0:19000",
+		})
+		wantInvalidArgument(t, "ReceiveLiveMigration", err)
+	})
+	t.Run("SendLiveMigration", func(t *testing.T) {
+		_, err := s.SendLiveMigration(ctx, &ateletpb.SendLiveMigrationRequest{
+			ActorName: okID, TargetAteomUid: badUID,
+			DestinationUrl: "tcp:10.0.0.2:19000",
+		})
+		wantInvalidArgument(t, "SendLiveMigration", err)
+	})
 }
 
 func TestBuildAteomWorkloadSpecForwardsReadyz(t *testing.T) {

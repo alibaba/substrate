@@ -1050,6 +1050,72 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	return &ateletpb.RestoreResponse{}, nil
 }
 
+func (s *AteomHerder) ReceiveLiveMigration(ctx context.Context, req *ateletpb.ReceiveLiveMigrationRequest) (*ateletpb.ReceiveLiveMigrationResponse, error) {
+	if err := validateReceiveLiveMigrationRequest(req); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	atespace, actorName := req.GetAtespace(), req.GetActorName()
+	sandboxRec, err := recordFromRequest(req.GetSandboxAssets())
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	assetPaths, err := s.ensureSandboxAssets(ctx, sandboxRec)
+	if err != nil {
+		return nil, err
+	}
+	if err := resetActorDirs(atespace, actorName); err != nil {
+		return nil, fmt.Errorf("while resetting actor dirs: %w", err)
+	}
+	if err := writeSandboxRecord(atespace, actorName, sandboxRec); err != nil {
+		return nil, fmt.Errorf("while recording sandbox assets: %w", err)
+	}
+	if err := s.prepareOCIBundles(ctx, atespace, actorName, req.GetSpec(), req.GetTargetAteomUid()); err != nil {
+		return nil, err
+	}
+	client, err := s.dialAteom(ctx, req.GetTargetAteomUid())
+	if err != nil {
+		return nil, err
+	}
+	if _, err := client.ReceiveLiveMigration(ctx, &ateompb.ReceiveLiveMigrationRequest{
+		Atespace:               atespace,
+		ActorName:              actorName,
+		ActorTemplateNamespace: req.GetActorTemplateNamespace(),
+		ActorTemplateName:      req.GetActorTemplateName(),
+		RuntimeAssetPaths:      assetPaths,
+		Spec:                   buildAteomWorkloadSpec(req.GetSpec()),
+		ReceiverUrl:            req.GetReceiverUrl(),
+		MemoryMode:             req.GetMemoryMode(),
+		TlsDir:                 req.GetTlsDir(),
+	}); err != nil {
+		return nil, fmt.Errorf("while calling ateom.ReceiveLiveMigration: %w", err)
+	}
+	return &ateletpb.ReceiveLiveMigrationResponse{}, nil
+}
+
+func (s *AteomHerder) SendLiveMigration(ctx context.Context, req *ateletpb.SendLiveMigrationRequest) (*ateletpb.SendLiveMigrationResponse, error) {
+	if err := validateSendLiveMigrationRequest(req); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+	client, err := s.dialAteom(ctx, req.GetTargetAteomUid())
+	if err != nil {
+		return nil, err
+	}
+	if _, err := client.SendLiveMigration(ctx, &ateompb.SendLiveMigrationRequest{
+		ActorName:       req.GetActorName(),
+		DestinationUrl:  req.GetDestinationUrl(),
+		DowntimeMs:      req.GetDowntimeMs(),
+		TimeoutS:        req.GetTimeoutS(),
+		TimeoutStrategy: req.GetTimeoutStrategy(),
+		Connections:     req.GetConnections(),
+		MemoryMode:      req.GetMemoryMode(),
+		TlsDir:          req.GetTlsDir(),
+	}); err != nil {
+		return nil, fmt.Errorf("while calling ateom.SendLiveMigration: %w", err)
+	}
+	return &ateletpb.SendLiveMigrationResponse{}, nil
+}
+
 func externalSnapshotURIPrefix(req interface {
 	GetType() ateletpb.CheckpointType
 	GetExternalConfig() *ateletpb.ExternalCheckpointConfiguration
@@ -1449,6 +1515,44 @@ func validateRestoreRequest(req *ateletpb.RestoreRequest) error {
 		return fmt.Errorf("invalid checkpoint type: %v", req.GetType())
 	}
 	return nil
+}
+
+func validateReceiveLiveMigrationRequest(req *ateletpb.ReceiveLiveMigrationRequest) error {
+	var errs field.ErrorList
+	errs = append(errs, resources.ValidateResourceName(req.GetAtespace(), field.NewPath("atespace"))...)
+	errs = append(errs, resources.ValidateResourceName(req.GetActorName(), field.NewPath("actor_name"))...)
+	for _, msg := range content.IsDNS1123Label(req.GetActorTemplateNamespace()) {
+		errs = append(errs, field.Invalid(field.NewPath("actor_template_namespace"), req.GetActorTemplateNamespace(), msg))
+	}
+	for _, msg := range content.IsDNS1123Subdomain(req.GetActorTemplateName()) {
+		errs = append(errs, field.Invalid(field.NewPath("actor_template_name"), req.GetActorTemplateName(), msg))
+	}
+	if req.GetReceiverUrl() == "" {
+		errs = append(errs, field.Required(field.NewPath("receiver_url"), ""))
+	}
+	if len(errs) > 0 {
+		return errs.ToAggregate()
+	}
+	if err := resources.ValidateAteomUID(req.GetTargetAteomUid()); err != nil {
+		return err
+	}
+	names := make([]string, 0, len(req.GetSpec().GetContainers()))
+	for _, ctr := range req.GetSpec().GetContainers() {
+		names = append(names, ctr.GetName())
+	}
+	return resources.ValidateContainerNames(names)
+}
+
+func validateSendLiveMigrationRequest(req *ateletpb.SendLiveMigrationRequest) error {
+	var errs field.ErrorList
+	errs = append(errs, resources.ValidateResourceName(req.GetActorName(), field.NewPath("actor_name"))...)
+	if req.GetDestinationUrl() == "" {
+		errs = append(errs, field.Required(field.NewPath("destination_url"), ""))
+	}
+	if len(errs) > 0 {
+		return errs.ToAggregate()
+	}
+	return resources.ValidateAteomUID(req.GetTargetAteomUid())
 }
 
 func validateSnapshotScope(scope ateletpb.SnapshotScope) error {
