@@ -18,20 +18,34 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
+	"sync"
 	"time"
 )
 
 const (
 	directProxyRetryBudget = 3 * time.Second
 	directProxyRetryDelay  = 50 * time.Millisecond
+	directProxyStaleHeader = "X-Substrate-Stale"
+
+	directProxyCachedAttemptTimeout = 250 * time.Millisecond
 )
 
+type cachedDirectProxyResponse struct {
+	statusCode int
+	header     http.Header
+	body       []byte
+}
+
+type directProxyResponseCache struct {
+	mu      sync.RWMutex
+	entries map[string]cachedDirectProxyResponse
+}
+
 func (s *RouterServer) serveDirectHTTPProxy(ctx context.Context) error {
-	addr := fmt.Sprintf(":%d", s.cfg.HttpPort)
+	addr := fmt.Sprintf(":%d", s.directHTTPProxyPort())
 	server := &http.Server{
 		Addr:    addr,
 		Handler: http.HandlerFunc(s.handleDirectProxy),
@@ -52,6 +66,13 @@ func (s *RouterServer) serveDirectHTTPProxy(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func (s *RouterServer) directHTTPProxyPort() int {
+	if s.cfg.DirectHTTPProxyPort > 0 {
+		return s.cfg.DirectHTTPProxyPort
+	}
+	return s.cfg.HttpPort
 }
 
 func (s *RouterServer) handleDirectProxy(w http.ResponseWriter, req *http.Request) {
@@ -81,6 +102,8 @@ func (s *RouterServer) handleDirectProxy(w http.ResponseWriter, req *http.Reques
 			slog.Any("err", err))
 		http.Error(w, "upstream actor request failed", http.StatusBadGateway)
 		return
+	} else if s.writeCachedDirectProxyResponse(w, directProxyCacheKey(atespace, actorName, req)) {
+		return
 	}
 
 	deadline := time.Now().Add(directProxyRetryBudget)
@@ -99,6 +122,9 @@ func (s *RouterServer) handleDirectProxy(w http.ResponseWriter, req *http.Reques
 		}
 		if err := s.serveDirectProxyTarget(w, req, atespace, actorName, routeTarget); err != nil {
 			lastErr = err
+			if s.writeCachedDirectProxyResponse(w, directProxyCacheKey(atespace, actorName, req)) {
+				return
+			}
 			continue
 		}
 		return
@@ -113,32 +139,102 @@ func (s *RouterServer) handleDirectProxy(w http.ResponseWriter, req *http.Reques
 }
 
 func (s *RouterServer) serveDirectProxyTarget(w http.ResponseWriter, req *http.Request, atespace, actorName string, routeTarget routeTarget) error {
-	target := &url.URL{
-		Scheme: "http",
-		Host:   routeTarget.HostPort(),
+	cacheKey := directProxyCacheKey(atespace, actorName, req)
+	targetHost := routeTarget.HostPort()
+	out := req.Clone(req.Context())
+	out.URL.Scheme = "http"
+	out.URL.Host = targetHost
+	out.Host = targetHost
+	out.RequestURI = ""
+	if s.hasCachedDirectProxyResponse(cacheKey, req) {
+		attemptCtx, cancel := context.WithTimeout(req.Context(), directProxyCachedAttemptTimeout)
+		defer cancel()
+		out = out.WithContext(attemptCtx)
 	}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	if s.directProxyTransport != nil {
-		proxy.Transport = s.directProxyTransport
+
+	transport := s.directProxyTransport
+	if transport == nil {
+		transport = http.DefaultTransport
 	}
-	originalDirector := proxy.Director
-	proxy.Director = func(out *http.Request) {
-		originalDirector(out)
-		out.Host = target.Host
-		out.URL.Scheme = target.Scheme
-		out.URL.Host = target.Host
-	}
-	var proxyErr error
-	proxy.ErrorHandler = func(w http.ResponseWriter, req *http.Request, err error) {
-		proxyErr = err
+
+	resp, err := transport.RoundTrip(out)
+	if err != nil {
 		slog.WarnContext(req.Context(), "direct HTTP proxy upstream attempt failed",
 			slog.String("atespace", atespace),
 			slog.String("actor", actorName),
-			slog.String("target", target.Host),
+			slog.String("target", targetHost),
 			slog.Any("err", err))
+		return err
 	}
-	proxy.ServeHTTP(w, req)
-	return proxyErr
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	copyHeader(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	if len(body) > 0 {
+		if _, err := w.Write(body); err != nil {
+			return err
+		}
+	}
+	s.storeCachedDirectProxyResponse(cacheKey, req, resp.StatusCode, resp.Header, body)
+	return nil
+}
+
+func copyHeader(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func directProxyCacheKey(atespace, actorName string, req *http.Request) string {
+	return atespace + "/" + actorName + " " + req.Method + " " + req.URL.RequestURI()
+}
+
+func (s *RouterServer) storeCachedDirectProxyResponse(key string, req *http.Request, statusCode int, header http.Header, body []byte) {
+	if req.Method != http.MethodGet || statusCode != http.StatusOK {
+		return
+	}
+	s.directProxyCache.mu.Lock()
+	defer s.directProxyCache.mu.Unlock()
+	if s.directProxyCache.entries == nil {
+		s.directProxyCache.entries = map[string]cachedDirectProxyResponse{}
+	}
+	s.directProxyCache.entries[key] = cachedDirectProxyResponse{
+		statusCode: statusCode,
+		header:     header.Clone(),
+		body:       append([]byte(nil), body...),
+	}
+}
+
+func (s *RouterServer) hasCachedDirectProxyResponse(key string, req *http.Request) bool {
+	if req.Method != http.MethodGet {
+		return false
+	}
+	s.directProxyCache.mu.RLock()
+	_, ok := s.directProxyCache.entries[key]
+	s.directProxyCache.mu.RUnlock()
+	return ok
+}
+
+func (s *RouterServer) writeCachedDirectProxyResponse(w http.ResponseWriter, key string) bool {
+	s.directProxyCache.mu.RLock()
+	cached, ok := s.directProxyCache.entries[key]
+	s.directProxyCache.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	copyHeader(w.Header(), cached.header)
+	w.Header().Set(directProxyStaleHeader, "true")
+	w.WriteHeader(cached.statusCode)
+	if len(cached.body) > 0 {
+		_, _ = w.Write(cached.body)
+	}
+	return true
 }
 
 func isDirectProxyRetryable(req *http.Request) bool {

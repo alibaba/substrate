@@ -54,6 +54,7 @@ type LifecycleEvent struct {
 	HTTPStatus      int    `json:"http_status,omitempty"`
 	HTTPChecksum    string `json:"http_checksum,omitempty"`
 	HTTPBody        string `json:"http_body,omitempty"`
+	HTTPStale       bool   `json:"http_stale,omitempty"`
 	HTTPCounter     int64  `json:"http_counter,omitempty"`
 	HTTPInstanceID  string `json:"http_instance_id,omitempty"`
 	HTTPNodeName    string `json:"http_node_name,omitempty"`

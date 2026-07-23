@@ -22,8 +22,10 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -249,7 +251,7 @@ func RunHotMigration(ctx context.Context, cfg HotMigrationConfig, out io.Writer)
 		return fmt.Errorf("new router http prober: %w", err)
 	}
 	defer prober.Close()
-	prober.client.Timeout = 2 * time.Second
+	prober.client.Timeout = 6 * time.Second
 
 	if !cfg.BootSource {
 		if err := waitForActorTemplateGolden(ctx, base.Kubeconfig, base.ActorTemplateNamespace, base.ActorTemplateName, cfg.ActorTemplateTimeout); err != nil {
@@ -423,6 +425,7 @@ func runHotMigrationSample(ctx context.Context, client *ateclient.Client, prober
 			HTTPInstanceID: result.InstanceID,
 			HTTPNodeName:   result.NodeName,
 			HTTPBody:       result.Body,
+			HTTPStale:      result.Stale,
 		}
 		applyPlacementToEvent(&ev, source, target)
 		if err != nil {
@@ -733,6 +736,7 @@ func runCrossNodeRecoverSample(ctx context.Context, client *ateclient.Client, pr
 			HTTPStatus:   result.StatusCode,
 			HTTPChecksum: result.Checksum,
 			HTTPBody:     result.Body,
+			HTTPStale:    result.Stale,
 		}
 		if source.node != "" {
 			ev.SourceWorker = source.key()
@@ -1228,6 +1232,7 @@ type httpProbeResult struct {
 	InstanceID string
 	NodeName   string
 	Body       string
+	Stale      bool
 }
 
 func parseHTTPProbeBody(body []byte) httpProbeResult {
@@ -1279,7 +1284,7 @@ func newRouterHTTPProber(ctx context.Context, kubeconfig string) (*routerHTTPPro
 		return nil, fmt.Errorf("new k8s client: %w", err)
 	}
 	const namespace = "ate-system"
-	const serviceName = "atenet-router"
+	serviceName := routerHTTPServiceName()
 	svc, err := clientset.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("get %s service: %w", serviceName, err)
@@ -1348,6 +1353,13 @@ func newRouterHTTPProber(ctx context.Context, kubeconfig string) (*routerHTTPPro
 	}, nil
 }
 
+func routerHTTPServiceName() string {
+	if serviceName := os.Getenv("PERFKIT_ROUTER_SERVICE_NAME"); serviceName != "" {
+		return serviceName
+	}
+	return "atenet-router"
+}
+
 func (p *routerHTTPProber) Close() {
 	close(p.stopCh)
 }
@@ -1371,6 +1383,7 @@ func (p *routerHTTPProber) Do(ctx context.Context, method, atespace, actor, path
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	result := parseHTTPProbeBody(body)
 	result.StatusCode = resp.StatusCode
+	result.Stale = resp.Header.Get("X-Substrate-Stale") == "true"
 	if readErr != nil {
 		return result, readErr
 	}
@@ -1402,48 +1415,84 @@ type continuousProbeSample struct {
 }
 
 func startContinuousProbe(ctx context.Context, prober *routerHTTPProber, atespace, actor, path string, interval time.Duration) continuousProbeRun {
+	return startContinuousProbeWithDo(ctx, func(ctx context.Context) (httpProbeResult, error) {
+		return prober.Probe(ctx, atespace, actor, path)
+	}, interval)
+}
+
+func startContinuousProbeWithDo(ctx context.Context, probe func(context.Context) (httpProbeResult, error), interval time.Duration) continuousProbeRun {
 	done := make(chan continuousProbeStats, 1)
 	go func() {
 		defer close(done)
-		stats := continuousProbeStats{statusCounts: map[string]int{}}
-		var lastSuccess time.Time
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		for {
+
+		var (
+			mu      sync.Mutex
+			wg      sync.WaitGroup
+			samples []continuousProbeSample
+			nextSeq int
+		)
+		launch := func() {
+			nextSeq++
+			seq := nextSeq
 			start := time.Now()
-			result, err := prober.Probe(ctx, atespace, actor, path)
-			end := time.Now()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				result, err := probe(ctx)
+				sample := continuousProbeSample{
+					sequence: seq,
+					start:    start,
+					end:      time.Now(),
+					result:   result,
+					err:      err,
+				}
+				mu.Lock()
+				samples = append(samples, sample)
+				mu.Unlock()
+			}()
+		}
+
+		launch()
+		for running := true; running; {
+			select {
+			case <-ctx.Done():
+				running = false
+			case <-ticker.C:
+				launch()
+			}
+		}
+		wg.Wait()
+
+		mu.Lock()
+		sort.Slice(samples, func(i, j int) bool {
+			return samples[i].sequence < samples[j].sequence
+		})
+		mu.Unlock()
+
+		stats := continuousProbeStats{statusCounts: map[string]int{}, samples: samples}
+		var lastSuccess time.Time
+		for _, sample := range samples {
 			stats.requests++
-			stats.samples = append(stats.samples, continuousProbeSample{
-				sequence: stats.requests,
-				start:    start,
-				end:      end,
-				result:   result,
-				err:      err,
-			})
 			statusKey := "error"
-			if result.StatusCode > 0 {
-				statusKey = strconv.Itoa(result.StatusCode)
+			if sample.result.StatusCode > 0 {
+				statusKey = strconv.Itoa(sample.result.StatusCode)
 			}
 			stats.statusCounts[statusKey]++
-			if err == nil && result.StatusCode == http.StatusOK {
+			if sample.err == nil && sample.result.StatusCode == http.StatusOK {
 				stats.successes++
 				if !lastSuccess.IsZero() {
-					if gap := start.Sub(lastSuccess); gap > stats.longestSuccessGap {
+					if gap := sample.start.Sub(lastSuccess); gap > stats.longestSuccessGap {
 						stats.longestSuccessGap = gap
 					}
 				}
-				lastSuccess = start
+				lastSuccess = sample.start
 			} else {
 				stats.failures++
 			}
-			select {
-			case <-ctx.Done():
-				done <- stats
-				return
-			case <-ticker.C:
-			}
 		}
+		done <- stats
 	}()
 	return continuousProbeRun{done: done}
 }
@@ -1469,6 +1518,7 @@ func continuousProbeSampleEvent(runID, stage, workload, round, actorID, actor st
 		HTTPInstanceID: sample.result.InstanceID,
 		HTTPNodeName:   sample.result.NodeName,
 		HTTPBody:       sample.result.Body,
+		HTTPStale:      sample.result.Stale,
 		ProbeSequence:  sample.sequence,
 	}
 	if sample.err != nil {

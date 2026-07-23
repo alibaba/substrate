@@ -15,6 +15,8 @@
 package runner
 
 import (
+	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -132,6 +134,50 @@ func TestContinuousProbeSampleEventKeepsTimingAndStatus(t *testing.T) {
 	}
 	if ev.Result != "ok" || ev.HTTPStatus != 200 || ev.HTTPChecksum != "sum" || ev.HTTPCounter != 9 {
 		t.Fatalf("unexpected probe event HTTP fields: %+v", ev)
+	}
+}
+
+func TestContinuousProbeStartsRequestsAtFixedInterval(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := make(chan time.Time, 10)
+	probe := func(ctx context.Context) (httpProbeResult, error) {
+		started <- time.Now()
+		select {
+		case <-ctx.Done():
+			return httpProbeResult{}, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+			return httpProbeResult{StatusCode: http.StatusOK}, nil
+		}
+	}
+
+	run := startContinuousProbeWithDo(ctx, probe, 50*time.Millisecond)
+	for i := 0; i < 3; i++ {
+		select {
+		case <-started:
+		case <-time.After(160 * time.Millisecond):
+			t.Fatalf("probe %d did not start at fixed interval", i+1)
+		}
+	}
+
+	cancel()
+	<-run.done
+}
+
+func TestRouterHTTPServiceNameDefaultsToAtenetRouter(t *testing.T) {
+	t.Setenv("PERFKIT_ROUTER_SERVICE_NAME", "")
+
+	if got := routerHTTPServiceName(); got != "atenet-router" {
+		t.Fatalf("routerHTTPServiceName() = %q, want atenet-router", got)
+	}
+}
+
+func TestRouterHTTPServiceNameCanBeOverridden(t *testing.T) {
+	t.Setenv("PERFKIT_ROUTER_SERVICE_NAME", "atenet-router-direct")
+
+	if got := routerHTTPServiceName(); got != "atenet-router-direct" {
+		t.Fatalf("routerHTTPServiceName() = %q, want atenet-router-direct", got)
 	}
 }
 

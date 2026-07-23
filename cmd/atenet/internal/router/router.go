@@ -81,6 +81,9 @@ type RouterConfig struct {
 	LogLevel        string
 	MetricsAddr     string
 	DirectHTTPProxy bool
+	// DirectHTTPProxyPort overrides HttpPort for the direct proxy listener.
+	// This lets test deployments run Envoy and the direct proxy side by side.
+	DirectHTTPProxyPort int
 	// OtlpCollectorAddress is the host:port of the OTLP gRPC collector that
 	// Envoy reports tracing spans to. Empty disables Envoy-side tracing.
 	OtlpCollectorAddress string
@@ -105,6 +108,7 @@ type RouterServer struct {
 	inflight   *inFlightTracker
 
 	directProxyTransport http.RoundTripper
+	directProxyCache     directProxyResponseCache
 }
 
 func NewRouterServer(cfg RouterConfig) (*RouterServer, error) {

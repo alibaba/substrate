@@ -116,6 +116,23 @@ func TestXdsServer_UpdateSnapshot(t *testing.T) {
 		if fallbackRoute.GetMatch().GetPrefix() != "/" {
 			t.Errorf("Expected path mapping prefix '/', got '%s'", fallbackRoute.GetMatch().GetPrefix())
 		}
+		action := fallbackRoute.GetRoute()
+		if action.GetTimeout().AsDuration() != 5*time.Second {
+			t.Fatalf("route timeout = %s, want 5s", action.GetTimeout().AsDuration())
+		}
+		retry := action.GetRetryPolicy()
+		if retry == nil {
+			t.Fatal("route retry policy is nil")
+		}
+		if retry.GetRetryOn() != "connect-failure,reset,refused-stream,5xx,gateway-error" {
+			t.Fatalf("retry_on = %q", retry.GetRetryOn())
+		}
+		if retry.GetNumRetries().GetValue() != 20 {
+			t.Fatalf("num_retries = %d, want 20", retry.GetNumRetries().GetValue())
+		}
+		if retry.GetPerTryTimeout().AsDuration() != 500*time.Millisecond {
+			t.Fatalf("per_try_timeout = %s, want 500ms", retry.GetPerTryTimeout().AsDuration())
+		}
 	}
 
 	// Verify listeners generated

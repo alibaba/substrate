@@ -44,6 +44,7 @@ func NewRouterCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfg.LogLevel, "log-level", "info", "Log level: debug, info, warn, error")
 	cmd.Flags().StringVar(&cfg.MetricsAddr, "metrics-listen-addr", ":9090", "Address and port the prometheus metrics server should listen on.")
 	cmd.Flags().BoolVar(&cfg.DirectHTTPProxy, "direct-http-proxy", false, "Serve workload HTTP traffic directly from atenet without Envoy. Intended for controlled migration tests.")
+	cmd.Flags().IntVar(&cfg.DirectHTTPProxyPort, "direct-http-proxy-port", 0, "TCP port for direct workload HTTP proxy. Defaults to --port-http when unset.")
 	cmd.Flags().BoolVar(&cfg.Standalone, "standalone", false, "Run in standalone mode, bypassing creation of managed deployment and services in Kubernetes cluster")
 	cmd.Flags().StringVar(&cfg.Namespace, "namespace", "default", "Target operations namespace")
 	cmd.Flags().StringVar(&cfg.Kubeconfig, "kubeconfig", "", "Absolute path to the kubeconfig configuration file")

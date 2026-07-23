@@ -66,6 +66,8 @@ const (
 	RouteName            = "substrate_routes"
 	ClusterName          = "ate-cluster"
 	OtlpClusterName      = "otel_collector_cluster"
+
+	migrationShieldRetryOn = "connect-failure,reset,refused-stream,5xx,gateway-error"
 )
 
 // XdsServer implements an aggregated discovery service server for dynamic Envoy router nodes.
@@ -373,7 +375,16 @@ func (x *XdsServer) buildRoutes() *routev3.RouteConfiguration {
 								ClusterSpecifier: &routev3.RouteAction_Cluster{
 									Cluster: "dynamic_forward_proxy_cluster",
 								},
-								Timeout: durationpb.New(10 * time.Second),
+								Timeout: durationpb.New(5 * time.Second),
+								RetryPolicy: &routev3.RetryPolicy{
+									RetryOn:       migrationShieldRetryOn,
+									NumRetries:    &wrapperspb.UInt32Value{Value: 20},
+									PerTryTimeout: durationpb.New(500 * time.Millisecond),
+									RetryBackOff: &routev3.RetryPolicy_RetryBackOff{
+										BaseInterval: durationpb.New(50 * time.Millisecond),
+										MaxInterval:  durationpb.New(100 * time.Millisecond),
+									},
+								},
 							},
 						},
 					},
