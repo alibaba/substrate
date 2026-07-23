@@ -846,6 +846,27 @@ func TestAcquireLock_TTLExpiration(t *testing.T) {
 	}
 }
 
+func TestRenewLockPreservesOwner(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+	const key, owner = "lock:renew", "owner-1"
+	if ok, err := s.AcquireLock(ctx, key, owner, 40*time.Millisecond); err != nil || !ok {
+		t.Fatalf("AcquireLock=(%v,%v)", ok, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	ok, err := s.RenewLock(ctx, key, owner, 80*time.Millisecond)
+	if err != nil || !ok {
+		t.Fatalf("RenewLock=(%v,%v), want true,nil", ok, err)
+	}
+	time.Sleep(35 * time.Millisecond)
+	if ok, err := s.AcquireLock(ctx, key, "owner-2", time.Second); err != nil || ok {
+		t.Fatalf("competing AcquireLock=(%v,%v), want false,nil", ok, err)
+	}
+	if ok, err := s.RenewLock(ctx, key, "wrong-owner", time.Second); err != nil || ok {
+		t.Fatalf("wrong-owner RenewLock=(%v,%v), want false,nil", ok, err)
+	}
+}
+
 func receiveEvent(t *testing.T, ch <-chan store.WorkerEvent) store.WorkerEvent {
 	t.Helper()
 	select {

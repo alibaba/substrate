@@ -62,10 +62,17 @@ func AteomNetNSPath(podUID string) string {
 
 func ActorPath(atespace, actorName string) string {
 	return filepath.Join(
-		BasePath,
-		"actors",
+		ActorsDir(),
 		atespace+":"+actorName,
 	)
+}
+
+func ActorsDir() string {
+	return filepath.Join(BasePath, "actors")
+}
+
+func SnapshotCacheDir() string {
+	return filepath.Join(BasePath, "snapshot-cache")
 }
 
 // ActorIdentityDirPath is the host directory atelet populates with the

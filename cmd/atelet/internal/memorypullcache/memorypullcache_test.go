@@ -15,7 +15,11 @@
 package memorypullcache
 
 import (
+	"io"
 	"testing"
+
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"k8s.io/utils/lru"
 )
 
 func TestIsLocalRegistry(t *testing.T) {
@@ -80,5 +84,40 @@ func TestRewriteLocalRegistry(t *testing.T) {
 				t.Errorf("rewriteLocalRegistry(%q) = %q; want %q", tt.ref, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDiskCacheSurvivesNewMemoryPullCache(t *testing.T) {
+	dir := t.TempDir()
+	digest := "sha256:0123456789abcdef"
+	tarBytes := []byte("rootfs tar bytes")
+	cfg := v1.Config{Entrypoint: []string{"/ko-app/counter"}}
+
+	c1 := &MemoryPullCache{cache: lru.New(1), diskCacheDir: dir}
+	if err := c1.writeDiskCache(digest, tarBytes, cfg); err != nil {
+		t.Fatalf("writeDiskCache: %v", err)
+	}
+
+	c2 := &MemoryPullCache{cache: lru.New(1), diskCacheDir: dir}
+	rc, gotCfg, ok, err := c2.readDiskCache(digest)
+	if err != nil {
+		t.Fatalf("readDiskCache: %v", err)
+	}
+	if !ok {
+		t.Fatal("readDiskCache ok=false, want true")
+	}
+	defer rc.Close()
+	gotTar, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(gotTar) != string(tarBytes) {
+		t.Fatalf("tar bytes = %q, want %q", gotTar, tarBytes)
+	}
+	if gotCfg.Entrypoint[0] != cfg.Entrypoint[0] {
+		t.Fatalf("config entrypoint = %v, want %v", gotCfg.Entrypoint, cfg.Entrypoint)
+	}
+	if _, ok := c2.cache.Get(digest); !ok {
+		t.Fatal("readDiskCache did not populate memory cache")
 	}
 }

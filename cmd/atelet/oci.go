@@ -17,6 +17,8 @@ package main
 import (
 	"archive/tar"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +28,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/agent-substrate/substrate/cmd/atelet/internal/memorypullcache"
 	"github.com/agent-substrate/substrate/internal/ateompath"
@@ -54,6 +57,8 @@ const (
 	ActorIDFileName = "actor-id"
 )
 
+var ociRootFSCacheLocks sync.Map
+
 func prepareOCIDirectory(ctx context.Context, pullCache *memorypullcache.MemoryPullCache, atespace, actorName, containerName, ref string, args []string, env []string, annotations map[string]string, netns string, identityDir string, durableDirVolumeMounts []*ateletpb.VolumeMount) error {
 	tracer := otel.Tracer("prepareOCIDirectory")
 
@@ -78,7 +83,11 @@ func prepareOCIDirectory(ctx context.Context, pullCache *memorypullcache.MemoryP
 	}
 	defer tarData.Close()
 
-	if err := untar(ctx, tarData, rootPath); err != nil {
+	if ociRootFSCacheEnabled() {
+		if err := prepareRootFSFromCache(ctx, tarData, rootPath, ref); err != nil {
+			return fmt.Errorf("in prepareRootFSFromCache: %w", err)
+		}
+	} else if err := untar(ctx, tarData, rootPath); err != nil {
 		return fmt.Errorf("in untar: %w", err)
 	}
 
@@ -102,6 +111,158 @@ func prepareOCIDirectory(ctx context.Context, pullCache *memorypullcache.MemoryP
 	}
 
 	return nil
+}
+
+func ociRootFSCacheEnabled() bool {
+	switch strings.ToLower(os.Getenv("ATE_OCI_ROOTFS_CACHE")) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func ociRootFSCacheBaseDir() string {
+	if v := os.Getenv("ATE_OCI_ROOTFS_CACHE_DIR"); v != "" {
+		return v
+	}
+	return filepath.Join(ateompath.BasePath, "oci-rootfs-cache")
+}
+
+func prepareRootFSFromCache(ctx context.Context, tarData io.Reader, rootPath, ref string) error {
+	key := ociRootFSCacheKey(ref)
+	lockAny, _ := ociRootFSCacheLocks.LoadOrStore(key, &sync.Mutex{})
+	lock := lockAny.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	cacheRoot := filepath.Join(ociRootFSCacheBaseDir(), key, "rootfs")
+	if cacheReady(cacheRoot) {
+		if stats, err := cloneRootFSTree(cacheRoot, rootPath); err == nil {
+			slog.InfoContext(ctx, "OCI rootfs cache hit",
+				slog.String("ref", ref),
+				slog.String("cache_key", key),
+				slog.String("clone_method", stats.method),
+				slog.Int("files", stats.files),
+				slog.Int("dirs", stats.dirs),
+				slog.Int("symlinks", stats.symlinks))
+			return nil
+		} else {
+			slog.WarnContext(ctx, "OCI rootfs cache clone failed; rebuilding cache",
+				slog.String("ref", ref), slog.String("cache_key", key), slog.Any("err", err))
+			if rmErr := os.RemoveAll(filepath.Dir(cacheRoot)); rmErr != nil {
+				return fmt.Errorf("while removing invalid rootfs cache %q: %w", filepath.Dir(cacheRoot), rmErr)
+			}
+		}
+	}
+
+	tmpRoot := filepath.Join(ociRootFSCacheBaseDir(), key+".tmp")
+	if err := os.RemoveAll(tmpRoot); err != nil {
+		return fmt.Errorf("while clearing temp rootfs cache %q: %w", tmpRoot, err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpRoot, "rootfs"), 0o700); err != nil {
+		return fmt.Errorf("while creating temp rootfs cache %q: %w", tmpRoot, err)
+	}
+	if err := untar(ctx, tarData, filepath.Join(tmpRoot, "rootfs")); err != nil {
+		return fmt.Errorf("while unpacking temp rootfs cache: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpRoot, ".ready"), []byte(ref+"\n"), 0o600); err != nil {
+		return fmt.Errorf("while marking temp rootfs cache ready: %w", err)
+	}
+	finalRoot := filepath.Join(ociRootFSCacheBaseDir(), key)
+	if err := os.RemoveAll(finalRoot); err != nil {
+		return fmt.Errorf("while clearing rootfs cache %q: %w", finalRoot, err)
+	}
+	if err := os.Rename(tmpRoot, finalRoot); err != nil {
+		return fmt.Errorf("while publishing rootfs cache %q: %w", finalRoot, err)
+	}
+
+	stats, err := cloneRootFSTree(cacheRoot, rootPath)
+	if err != nil {
+		return fmt.Errorf("while cloning populated rootfs cache: %w", err)
+	}
+	slog.InfoContext(ctx, "OCI rootfs cache miss populated",
+		slog.String("ref", ref),
+		slog.String("cache_key", key),
+		slog.String("clone_method", stats.method),
+		slog.Int("files", stats.files),
+		slog.Int("dirs", stats.dirs),
+		slog.Int("symlinks", stats.symlinks))
+	return nil
+}
+
+func ociRootFSCacheKey(ref string) string {
+	sum := sha256.Sum256([]byte(ref))
+	return hex.EncodeToString(sum[:])
+}
+
+func cacheReady(cacheRoot string) bool {
+	if _, err := os.Stat(filepath.Join(filepath.Dir(cacheRoot), ".ready")); err != nil {
+		return false
+	}
+	info, err := os.Stat(cacheRoot)
+	return err == nil && info.IsDir()
+}
+
+type cloneRootFSStats struct {
+	method   string
+	files    int
+	dirs     int
+	symlinks int
+}
+
+func cloneRootFSTree(srcRoot, dstRoot string) (cloneRootFSStats, error) {
+	stats := cloneRootFSStats{method: "none"}
+	if err := filepath.WalkDir(srcRoot, func(src string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcRoot, src)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		dst := filepath.Join(dstRoot, rel)
+		info, err := os.Lstat(src)
+		if err != nil {
+			return err
+		}
+		mode := info.Mode()
+		switch {
+		case mode.IsDir():
+			stats.dirs++
+			if err := os.MkdirAll(dst, mode.Perm()); err != nil {
+				return err
+			}
+			return os.Chmod(dst, mode.Perm())
+		case mode&os.ModeSymlink != 0:
+			stats.symlinks++
+			target, err := os.Readlink(src)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(target, dst)
+		case mode.IsRegular():
+			stats.files++
+			method, err := cloneRegularFile(src, dst, mode.Perm())
+			if err != nil {
+				return err
+			}
+			if stats.method == "none" {
+				stats.method = method
+			} else if stats.method != method {
+				stats.method = "mixed"
+			}
+			return nil
+		default:
+			return fmt.Errorf("unsupported cached rootfs entry %q with mode %v", src, mode)
+		}
+	}); err != nil {
+		return stats, err
+	}
+	return stats, nil
 }
 
 // mergeActorEnv merges the ActorTemplate env and the image's ENV, with the template taking precedence.
@@ -140,6 +301,10 @@ func buildActorOCISpec(atespace string, actorName string, imageCfg *v1.Config, a
 		imageEnv = imageCfg.Env
 	}
 	envVars := mergeActorEnv(imageEnv, env)
+	processArgs := args
+	if len(processArgs) == 0 && imageCfg != nil {
+		processArgs = append(append([]string{}, imageCfg.Entrypoint...), imageCfg.Cmd...)
+	}
 
 	mounts := []specs.Mount{
 		{
@@ -185,7 +350,7 @@ func buildActorOCISpec(atespace string, actorName string, imageCfg *v1.Config, a
 				UID: 0,
 				GID: 0,
 			},
-			Args: args,
+			Args: processArgs,
 			Env:  envVars,
 			Cwd:  "/",
 			Capabilities: &specs.LinuxCapabilities{

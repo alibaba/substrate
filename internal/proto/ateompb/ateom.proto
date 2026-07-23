@@ -132,6 +132,11 @@ message CheckpointWorkloadRequest {
 
   // What content to include in the checkpoint.
   SnapshotScope scope = 9;
+
+  // If true, leave the workload running after the snapshot is written.
+  // The implementation may pause the workload briefly to capture a consistent
+  // snapshot, but it must resume it before returning successfully.
+  bool preserve_running = 10;
 }
 
 message CheckpointWorkloadResponse {

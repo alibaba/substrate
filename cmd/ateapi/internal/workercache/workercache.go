@@ -45,6 +45,13 @@ type Cache struct {
 	ready atomic.Bool
 }
 
+// Stats summarizes the worker cache state for capacity diagnostics.
+type Stats struct {
+	Total    int
+	Free     int
+	Assigned int
+}
+
 // New creates a Cache backed by a given store. relistInterval controls how
 // often the cache performs a full ListWorkers to recover from state drifts
 // caused by missing WorkerWatch events.
@@ -82,6 +89,24 @@ func (c *Cache) Workers() ([]*ateapipb.Worker, error) {
 	out := make([]*ateapipb.Worker, 0, len(c.workers))
 	for _, w := range c.workers {
 		out = append(out, w)
+	}
+	return out, nil
+}
+
+// Stats returns a point-in-time capacity summary for all cached workers.
+func (c *Cache) Stats() (Stats, error) {
+	if !c.ready.Load() {
+		return Stats{}, fmt.Errorf("worker cache not ready")
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := Stats{Total: len(c.workers)}
+	for _, w := range c.workers {
+		if w.GetAssignment() == nil {
+			out.Free++
+		} else {
+			out.Assigned++
+		}
 	}
 	return out, nil
 }

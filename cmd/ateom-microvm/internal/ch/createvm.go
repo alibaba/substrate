@@ -53,8 +53,9 @@ type PlatformConfig struct {
 
 // CpusConfig sets the boot/max vCPU counts.
 type CpusConfig struct {
-	BootVcpus int32 `json:"boot_vcpus"`
-	MaxVcpus  int32 `json:"max_vcpus"`
+	BootVcpus      int32  `json:"boot_vcpus"`
+	MaxVcpus       int32  `json:"max_vcpus"`
+	CoreScheduling string `json:"core_scheduling,omitempty"`
 }
 
 // MemoryConfig sets guest RAM. Shared=true makes CH back RAM with a memfd, which

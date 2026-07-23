@@ -112,7 +112,9 @@ run_kubectl_ate() {
 run_ko() {
   # Build up a set of ldflags to pass to ko.
   local ldflags=()
-  mapfile -t ldflags < <(make ldflags)
+  while IFS= read -r ldflag; do
+    ldflags+=("${ldflag}")
+  done < <(make ldflags)
   for i in "${!ldflags[@]}"; do
     ldflags[i]="--ldflags=${ldflags[i]}"
   done

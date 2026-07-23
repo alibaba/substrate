@@ -18,15 +18,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
+	"github.com/agent-substrate/substrate/cmd/atelet/internal/ategcs"
 	"github.com/agent-substrate/substrate/internal/ateerrors"
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
@@ -36,6 +40,317 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/testing/protocmp"
 )
+
+func TestSnapshotStageSummary(t *testing.T) {
+	started := time.Now()
+	var summary snapshotStageSummary
+	summary.add(ategcs.SnapshotIOResult{
+		LogicalBytes:         100,
+		PopulatedBytes:       95,
+		StoredBytes:          40,
+		WrittenBytes:         90,
+		Duration:             7 * time.Millisecond,
+		SparseScanDuration:   time.Millisecond,
+		ExtentCopyDuration:   1500 * time.Microsecond,
+		PrepareDuration:      6 * time.Millisecond,
+		CompressionDuration:  2 * time.Millisecond,
+		StorageWriteDuration: 3 * time.Millisecond,
+		CloseDuration:        500 * time.Microsecond,
+		SyncDuration:         1500 * time.Microsecond,
+		PublishDuration:      4 * time.Millisecond,
+	})
+	summary.add(ategcs.SnapshotIOResult{
+		LogicalBytes:         200,
+		PopulatedBytes:       185,
+		StoredBytes:          60,
+		WrittenBytes:         180,
+		Duration:             11 * time.Millisecond,
+		SparseScanDuration:   2 * time.Millisecond,
+		ExtentCopyDuration:   2500 * time.Microsecond,
+		PrepareDuration:      7 * time.Millisecond,
+		CompressionDuration:  3 * time.Millisecond,
+		StorageWriteDuration: 4 * time.Millisecond,
+		CloseDuration:        time.Millisecond,
+		SyncDuration:         time.Millisecond,
+		PublishDuration:      5 * time.Millisecond,
+	})
+	got := summary.finish(started)
+	if got.FileCount != 2 || got.LogicalBytes != 300 || got.PopulatedBytes != 280 || got.StoredBytes != 100 || got.WrittenBytes != 270 {
+		t.Fatalf("totals = files:%d logical:%d populated:%d stored:%d written:%d", got.FileCount, got.LogicalBytes, got.PopulatedBytes, got.StoredBytes, got.WrittenBytes)
+	}
+	if got.IOTime != 18*time.Millisecond {
+		t.Errorf("IOTime=%v, want 18ms", got.IOTime)
+	}
+	if got.SparseScanDuration != 3*time.Millisecond {
+		t.Errorf("SparseScanDuration=%v, want 3ms", got.SparseScanDuration)
+	}
+	if got.ExtentCopyDuration != 4*time.Millisecond {
+		t.Errorf("ExtentCopyDuration=%v, want 4ms", got.ExtentCopyDuration)
+	}
+	if got.PrepareDuration != 13*time.Millisecond {
+		t.Errorf("PrepareDuration=%v, want 13ms", got.PrepareDuration)
+	}
+	if got.CompressionDuration != 5*time.Millisecond {
+		t.Errorf("CompressionDuration=%v, want 5ms", got.CompressionDuration)
+	}
+	if got.StorageWriteDuration != 7*time.Millisecond {
+		t.Errorf("StorageWriteDuration=%v, want 7ms", got.StorageWriteDuration)
+	}
+	if got.CloseDuration != 1500*time.Microsecond {
+		t.Errorf("CloseDuration=%v, want 1.5ms", got.CloseDuration)
+	}
+	if got.SyncDuration != 2500*time.Microsecond {
+		t.Errorf("SyncDuration=%v, want 2.5ms", got.SyncDuration)
+	}
+	if got.PublishDuration != 9*time.Millisecond {
+		t.Errorf("PublishDuration=%v, want 9ms", got.PublishDuration)
+	}
+	if got.WallTime <= 0 || got.WallTime >= got.IOTime {
+		t.Errorf("WallTime=%v, want positive and independent of summed IOTime=%v", got.WallTime, got.IOTime)
+	}
+}
+
+func TestDirectRestoreEligibility(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ATE_SNAPSHOT_FS_ROOT", root)
+	t.Setenv("ATE_SNAPSHOT_DIRECT_RESTORE", "1")
+	prefix := "gs://bucket/snapshot-1"
+	dir := filepath.Join(root, "bucket", "snapshot-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pages.img"), []byte("pages"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := &sandboxAssetsRecord{SnapshotFormat: snapshotFormatRawSparseV1, SnapshotFiles: []string{"pages.img"}}
+	got, ok, err := directRestorePath(prefix, rec)
+	if err != nil || !ok || got != dir {
+		t.Fatalf("directRestorePath=(%q,%v,%v), want (%q,true,nil)", got, ok, err, dir)
+	}
+	rec.SnapshotFormat = snapshotFormatSparseZstdV1
+	if _, ok, err := directRestorePath(prefix, rec); err != nil || ok {
+		t.Fatalf("compressed snapshot eligibility=(%v,%v), want false,nil", ok, err)
+	}
+}
+
+func TestDirectRestoreAllowsMicroVM(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ATE_SNAPSHOT_FS_ROOT", root)
+	t.Setenv("ATE_SNAPSHOT_DIRECT_RESTORE", "1")
+
+	prefix := "gs://bucket/snapshot-1"
+	dir := filepath.Join(root, "bucket", "snapshot-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"base-id", "config.json", "memory-ranges", "state.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := &sandboxAssetsRecord{
+		SandboxClass:   "microvm",
+		SnapshotFormat: snapshotFormatRawSparseV1,
+		SnapshotFiles:  []string{"base-id", "config.json", "memory-ranges", "state.json"},
+	}
+
+	got, ok, err := directRestorePath(prefix, rec)
+	if err != nil || !ok || got != dir {
+		t.Fatalf("directRestorePath=(%q,%v,%v), want (%q,true,nil)", got, ok, err, dir)
+	}
+}
+
+func TestStageMicroVMDirectRestoreLinksLargeFiles(t *testing.T) {
+	srcDir := t.TempDir()
+	dstDir := filepath.Join(t.TempDir(), "restore-state")
+	t.Setenv("ATE_MICROVM_DIRECT_RESTORE_LINK_MIN_BYTES", "16")
+
+	if err := os.WriteFile(filepath.Join(srcDir, "config.json"), []byte(`{"vsock":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "state.json"), []byte("state"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "memory-ranges"), []byte("0123456789abcdef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := stageMicroVMDirectRestore(dstDir, srcDir, []string{"config.json", "memory-ranges", "state.json"}); err != nil {
+		t.Fatalf("stageMicroVMDirectRestore: %v", err)
+	}
+
+	if target, err := os.Readlink(filepath.Join(dstDir, "memory-ranges")); err != nil || target != filepath.Join(srcDir, "memory-ranges") {
+		t.Fatalf("memory-ranges symlink=(%q,%v), want %q,nil", target, err, filepath.Join(srcDir, "memory-ranges"))
+	}
+	if info, err := os.Lstat(filepath.Join(dstDir, "config.json")); err != nil || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("config.json Lstat=(%v,%v), want copied regular file", info.Mode(), err)
+	}
+	if info, err := os.Lstat(filepath.Join(dstDir, "state.json")); err != nil || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("state.json Lstat=(%v,%v), want copied regular file", info.Mode(), err)
+	}
+}
+
+func TestDirectCheckpointEligibility(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ATE_SNAPSHOT_FS_ROOT", root)
+	t.Setenv("ATE_SNAPSHOT_DIRECT_CHECKPOINT", "1")
+	prefix := "gs://bucket/snapshot-1"
+	dir := filepath.Join(root, "bucket", "snapshot-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pages.img"), []byte("pages"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	req := validCheckpointRequest()
+	req.GetExternalConfig().SnapshotUriPrefix = prefix
+	rec := &sandboxAssetsRecord{SnapshotFormat: snapshotFormatRawSparseV1, SnapshotFiles: []string{"pages.img"}}
+	got, ok, err := directCheckpointPath(req, rec)
+	if err != nil || !ok || got != dir {
+		t.Fatalf("directCheckpointPath=(%q,%v,%v), want (%q,true,nil)", got, ok, err, dir)
+	}
+
+	rec.SnapshotFormat = snapshotFormatSparseZstdV1
+	if _, ok, err := directCheckpointPath(req, rec); err != nil || ok {
+		t.Fatalf("compressed snapshot eligibility=(%v,%v), want false,nil", ok, err)
+	}
+}
+
+func TestDirectCheckpointAllowsMicroVMWhenFilesAlreadyOnSnapshotFS(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ATE_SNAPSHOT_FS_ROOT", root)
+	t.Setenv("ATE_SNAPSHOT_DIRECT_CHECKPOINT", "1")
+
+	req := validCheckpointRequest()
+	req.GetExternalConfig().SnapshotUriPrefix = "gs://bucket/snapshot-1"
+	dir := filepath.Join(root, "bucket", "snapshot-1")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"base-id", "config.json", "memory-ranges", "state.json"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := &sandboxAssetsRecord{
+		SandboxClass:   "microvm",
+		SnapshotFormat: snapshotFormatRawSparseV1,
+		SnapshotFiles:  []string{"base-id", "config.json", "memory-ranges", "state.json"},
+	}
+
+	if got, ok, err := directCheckpointPath(req, rec); err != nil || !ok || got != dir {
+		t.Fatalf("directCheckpointPath=(%q,%v,%v), want (%q,true,nil)", got, ok, err, dir)
+	}
+}
+
+func TestCheckpointAlreadyOnSnapshotFS(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ATE_SNAPSHOT_FS_ROOT", root)
+	prefix := "gs://bucket/snapshot-1"
+	dir := filepath.Join(root, "bucket", "snapshot-1")
+	ok, err := checkpointAlreadyOnSnapshotFS(prefix, dir)
+	if err != nil || !ok {
+		t.Fatalf("checkpointAlreadyOnSnapshotFS=(%v,%v), want true,nil", ok, err)
+	}
+	ok, err = checkpointAlreadyOnSnapshotFS(prefix, filepath.Join(root, "bucket", "other"))
+	if err != nil || ok {
+		t.Fatalf("checkpointAlreadyOnSnapshotFS mismatch=(%v,%v), want false,nil", ok, err)
+	}
+}
+
+func TestUploadExternalCheckpointUsesRawChunksWhenConfigured(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("ATE_SNAPSHOT_FS_ROOT", filepath.Join(dir, "snapshots"))
+	t.Setenv("ATE_SNAPSHOT_RAW_CHUNK_BYTES", strconv.Itoa(2<<20))
+	t.Setenv("ATE_SNAPSHOT_RAW_CHUNK_CONCURRENCY", "3")
+
+	checkpointDir := filepath.Join(dir, "checkpoint")
+	if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, 5<<20)
+	for i := range want {
+		want[i] = byte((i * 19) % 251)
+	}
+	if err := os.WriteFile(filepath.Join(checkpointDir, "pages.img"), want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := &sandboxAssetsRecord{
+		SandboxClass:   "gvisor",
+		Assets:         map[string]assetEntry{"runsc": {URL: "gs://gvisor/runsc", SHA256: strings.Repeat("a", 64)}},
+		SnapshotFiles:  []string{"pages.img"},
+		SnapshotFormat: snapshotFormatRawSparseV1,
+	}
+	req := validCheckpointRequest()
+	req.GetExternalConfig().SnapshotUriPrefix = "gs://bucket/snap"
+
+	var h AteomHerder
+	manifest, summary, err := h.uploadExternalCheckpoint(context.Background(), req, checkpointDir, rec)
+	if err != nil {
+		t.Fatalf("uploadExternalCheckpoint: %v", err)
+	}
+	if summary.LogicalBytes != int64(len(want)) || summary.WrittenBytes != int64(len(want)) {
+		t.Fatalf("summary=%+v", summary)
+	}
+	var gotRec sandboxAssetsRecord
+	if err := json.Unmarshal(manifest, &gotRec); err != nil {
+		t.Fatal(err)
+	}
+	chunks := gotRec.SnapshotFileChunks["pages.img"]
+	if len(chunks) != 3 {
+		t.Fatalf("manifest chunks=%+v, want 3 chunks", chunks)
+	}
+	if diff := cmp.Diff([]string{"pages.img"}, gotRec.SnapshotFiles); diff != "" {
+		t.Fatalf("snapshot files diff (-want +got):\n%s", diff)
+	}
+
+	restoreDir := filepath.Join(dir, "restore")
+	if err := os.MkdirAll(restoreDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.downloadExternalCheckpoint(context.Background(), req.GetExternalConfig().GetSnapshotUriPrefix(), restoreDir, gotRec.SnapshotFiles, gotRec.snapshotFormat(), gotRec.SnapshotFileChunks); err != nil {
+		t.Fatalf("downloadExternalCheckpoint: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(restoreDir, "pages.img"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("restored chunked checkpoint differs")
+	}
+}
+
+func TestUploadExternalCheckpointRawSparseUsesObjectStoreWithoutSnapshotFS(t *testing.T) {
+	checkpointDir := t.TempDir()
+	want := []byte("raw checkpoint bytes")
+	if err := os.WriteFile(filepath.Join(checkpointDir, "pages.img"), want, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := &recordingObjectStorage{objects: map[string][]byte{}}
+	h := &AteomHerder{gcsClient: store}
+	req := validCheckpointRequest()
+	req.GetExternalConfig().SnapshotUriPrefix = "gs://bucket/snap"
+	rec := &sandboxAssetsRecord{
+		SandboxClass:   "microvm",
+		SnapshotFiles:  []string{"pages.img"},
+		SnapshotFormat: snapshotFormatRawSparseV1,
+	}
+
+	manifest, summary, err := h.uploadExternalCheckpoint(context.Background(), req, checkpointDir, rec)
+	if err != nil {
+		t.Fatalf("uploadExternalCheckpoint: %v", err)
+	}
+	if summary.LogicalBytes != int64(len(want)) || summary.StoredBytes != int64(len(want)) {
+		t.Fatalf("summary=%+v", summary)
+	}
+	if got := store.objects["bucket/snap/pages.img"]; !bytes.Equal(got, want) {
+		t.Fatalf("raw object bytes=%q, want %q", got, want)
+	}
+	if got := store.objects["bucket/snap/"+sandboxManifestName]; !bytes.Equal(got, manifest) {
+		t.Fatalf("manifest object=%q, want returned manifest %q", got, manifest)
+	}
+}
 
 func TestWriteFileAtomic(t *testing.T) {
 	dir := t.TempDir()
@@ -294,6 +609,27 @@ func (f fakeObjectStorage) GetObject(_ context.Context, _, _ string) (io.ReadClo
 }
 
 func (fakeObjectStorage) PutObject(_ context.Context, _, _ string, _ io.Reader) error { return nil }
+
+type recordingObjectStorage struct {
+	objects map[string][]byte
+}
+
+func (s *recordingObjectStorage) GetObject(_ context.Context, bucket, object string) (io.ReadCloser, error) {
+	b, ok := s.objects[bucket+"/"+object]
+	if !ok {
+		return nil, fmt.Errorf("object %q/%q not found", bucket, object)
+	}
+	return io.NopCloser(bytes.NewReader(b)), nil
+}
+
+func (s *recordingObjectStorage) PutObject(_ context.Context, bucket, object string, r io.Reader) error {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	s.objects[bucket+"/"+object] = b
+	return nil
+}
 
 // TestFetchAssetStreaming covers the streamed download: good asset cached,
 // over-cap rejected, hash mismatch rejected (failures leave no cache file).

@@ -35,11 +35,19 @@ import (
 
 type mockClient struct {
 	ateapipb.ControlClient
-	resumeFn func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error)
+	resumeFn   func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error)
+	getRouteFn func(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error)
 }
 
 func (m *mockClient) ResumeActor(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
 	return m.resumeFn(ctx, in, opts...)
+}
+
+func (m *mockClient) GetActorRoute(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error) {
+	if m.getRouteFn != nil {
+		return m.getRouteFn(ctx, in, opts...)
+	}
+	return nil, status.Error(codes.Unimplemented, "unimplemented")
 }
 
 func TestHandleRequestHeadersDoesNotLogSensitiveData(t *testing.T) {

@@ -17,6 +17,10 @@ package controlapi
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"os"
+	"strings"
+	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/resources"
@@ -29,6 +33,25 @@ import (
 func (s *Service) SuspendActor(ctx context.Context, req *ateapipb.SuspendActorRequest) (*ateapipb.SuspendActorResponse, error) {
 	if err := validateSuspendActorRequest(req); err != nil {
 		return nil, err
+	}
+
+	if asyncSuspendDefaultEnabled() {
+		actor, err := s.actorWorkflow.BeginSuspendActor(ctx, req.GetActor().GetAtespace(), req.GetActor().GetName())
+		if err != nil {
+			if errors.Is(err, store.ErrPersistenceRetry) {
+				return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")
+			}
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, status.Errorf(codes.NotFound, "Actor %s not found", req.GetActor().GetName())
+			}
+			return nil, err
+		}
+		if actor.GetStatus() == ateapipb.Actor_STATUS_SUSPENDING {
+			atespace := req.GetActor().GetAtespace()
+			name := req.GetActor().GetName()
+			go s.finishSuspendAsync(atespace, name)
+		}
+		return &ateapipb.SuspendActorResponse{Actor: actor}, nil
 	}
 
 	actor, err := s.actorWorkflow.SuspendActor(ctx, req.GetActor().GetAtespace(), req.GetActor().GetName())
@@ -59,4 +82,41 @@ func validateSuspendActorRequest(req *ateapipb.SuspendActorRequest) error {
 		return status.Error(codes.InvalidArgument, errs.ToAggregate().Error())
 	}
 	return nil
+}
+
+func asyncSuspendDefaultEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv("ATE_SUSPEND_ASYNC_DEFAULT"))
+	return raw == "1" || strings.EqualFold(raw, "true")
+}
+
+func (s *Service) finishSuspendAsync(atespace, name string) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), asyncSuspendTimeout())
+	defer cancel()
+	actor, err := s.actorWorkflow.SuspendActor(ctx, atespace, name)
+	if err != nil {
+		slog.ErrorContext(ctx, "Async suspend checkpoint failed",
+			slog.String("atespace", atespace),
+			slog.String("actor", name),
+			slog.Duration("duration", time.Since(start)),
+			slog.Any("err", err))
+		return
+	}
+	slog.InfoContext(ctx, "Async suspend checkpoint completed",
+		slog.String("atespace", atespace),
+		slog.String("actor", name),
+		slog.String("status", actor.GetStatus().String()),
+		slog.Duration("duration", time.Since(start)))
+}
+
+func asyncSuspendTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("ATE_SUSPEND_ASYNC_TIMEOUT"))
+	if raw == "" {
+		return 10 * time.Minute
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 10 * time.Minute
+	}
+	return d
 }

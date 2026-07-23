@@ -457,7 +457,7 @@ func buildVMConfig(id, kernel, image, kparams, serialLog string, memMiB, vcpus i
 		cmdline += " " + kparams
 	}
 	return ch.VmConfig{
-		Cpus:    ch.CpusConfig{BootVcpus: int32(vcpus), MaxVcpus: int32(vcpus)},
+		Cpus:    ch.CpusConfig{BootVcpus: int32(vcpus), MaxVcpus: int32(vcpus), CoreScheduling: "Off"},
 		Memory:  ch.MemoryConfig{Size: int64(memMiB) * 1024 * 1024, Shared: true},
 		Payload: ch.PayloadConfig{Kernel: kernel, Cmdline: cmdline},
 		Disks: []ch.DiskConfig{

@@ -18,6 +18,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/agent-substrate/substrate/internal/ateompath"
 	"github.com/agent-substrate/substrate/internal/proto/ateletpb"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
 
 type tarEntry struct {
@@ -114,6 +116,42 @@ func TestBuildActorOCISpec_IdentityMount(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("identity mount %q missing; mounts=%v", IdentityMountPath, spec.Mounts)
+	}
+}
+
+func TestBuildActorOCISpec_UsesImageCommandWhenArgsEmpty(t *testing.T) {
+	spec := buildActorOCISpec(
+		"atespace", "id",
+		&v1.Config{Entrypoint: []string{"/ko-app/pause"}, Cmd: []string{"--hold"}},
+		nil,
+		nil,
+		nil,
+		"/run/netns/x",
+		"",
+		nil,
+	)
+
+	want := []string{"/ko-app/pause", "--hold"}
+	if !slices.Equal(spec.Process.Args, want) {
+		t.Fatalf("Process.Args = %v, want %v", spec.Process.Args, want)
+	}
+}
+
+func TestBuildActorOCISpec_ExplicitArgsOverrideImageCommand(t *testing.T) {
+	spec := buildActorOCISpec(
+		"atespace", "id",
+		&v1.Config{Entrypoint: []string{"/image-entrypoint"}, Cmd: []string{"image-cmd"}},
+		[]string{"/explicit", "arg"},
+		nil,
+		nil,
+		"/run/netns/x",
+		"",
+		nil,
+	)
+
+	want := []string{"/explicit", "arg"}
+	if !slices.Equal(spec.Process.Args, want) {
+		t.Fatalf("Process.Args = %v, want %v", spec.Process.Args, want)
 	}
 }
 
@@ -323,6 +361,67 @@ func TestUntar_HappyPath(t *testing.T) {
 	if !os.SameFile(srcInfo, dstInfo) {
 		t.Errorf("bin/bash is not a hardlink to bin/sh")
 	}
+}
+
+func TestPrepareRootFSFromCache_ReusesUnpackedRootFS(t *testing.T) {
+	t.Setenv("ATE_OCI_ROOTFS_CACHE_DIR", t.TempDir())
+
+	firstRoot := t.TempDir()
+	entries := []tarEntry{
+		{name: "etc/", typeflag: tar.TypeDir},
+		{name: "etc/hostname", typeflag: tar.TypeReg, body: "first\n"},
+		{name: "bin/", typeflag: tar.TypeDir},
+		{name: "bin/app", typeflag: tar.TypeReg, mode: 0o755, body: "app\n"},
+	}
+	if err := prepareRootFSFromCache(context.Background(), bytes.NewReader(buildTar(t, entries)), firstRoot, "example.com/app@sha256:111"); err != nil {
+		t.Fatalf("first prepareRootFSFromCache: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(firstRoot, "etc", "hostname")); err != nil {
+		t.Fatalf("read first hostname: %v", err)
+	} else if string(got) != "first\n" {
+		t.Fatalf("first hostname = %q, want first", got)
+	}
+
+	secondRoot := t.TempDir()
+	if err := prepareRootFSFromCache(context.Background(), errReader{}, secondRoot, "example.com/app@sha256:111"); err != nil {
+		t.Fatalf("second prepareRootFSFromCache should hit cache without reading tar: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(secondRoot, "etc", "hostname")); err != nil {
+		t.Fatalf("read second hostname: %v", err)
+	} else if string(got) != "first\n" {
+		t.Fatalf("second hostname = %q, want cached first", got)
+	}
+}
+
+func TestPrepareRootFSFromCache_CloneDoesNotMutateCache(t *testing.T) {
+	t.Setenv("ATE_OCI_ROOTFS_CACHE_DIR", t.TempDir())
+
+	firstRoot := t.TempDir()
+	if err := prepareRootFSFromCache(context.Background(), bytes.NewReader(buildTar(t, []tarEntry{
+		{name: "etc/", typeflag: tar.TypeDir},
+		{name: "etc/config", typeflag: tar.TypeReg, body: "cached\n"},
+	})), firstRoot, "example.com/app@sha256:222"); err != nil {
+		t.Fatalf("first prepareRootFSFromCache: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(firstRoot, "etc", "config"), []byte("actor-mutated\n"), 0o644); err != nil {
+		t.Fatalf("mutating first clone: %v", err)
+	}
+
+	secondRoot := t.TempDir()
+	if err := prepareRootFSFromCache(context.Background(), errReader{}, secondRoot, "example.com/app@sha256:222"); err != nil {
+		t.Fatalf("second prepareRootFSFromCache: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(secondRoot, "etc", "config")); err != nil {
+		t.Fatalf("read second config: %v", err)
+	} else if string(got) != "cached\n" {
+		t.Fatalf("cached rootfs was mutated through clone; got %q", got)
+	}
+}
+
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) {
+	return 0, io.ErrUnexpectedEOF
 }
 
 func TestUntar_LaterEntryWins(t *testing.T) {

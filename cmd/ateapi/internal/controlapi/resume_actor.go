@@ -31,7 +31,7 @@ func (s *Service) ResumeActor(ctx context.Context, req *ateapipb.ResumeActorRequ
 		return nil, err
 	}
 
-	actor, err := s.actorWorkflow.ResumeActor(ctx, req.GetActor().GetAtespace(), req.GetActor().GetName(), req.GetBoot())
+	actor, err := s.actorWorkflow.ResumeActor(ctx, req.GetActor().GetAtespace(), req.GetActor().GetName(), req.GetBoot(), req.GetAvoidNodeName())
 	if err != nil {
 		if errors.Is(err, store.ErrPersistenceRetry) {
 			return nil, status.Error(codes.Aborted, "concurrent update conflict, please retry")

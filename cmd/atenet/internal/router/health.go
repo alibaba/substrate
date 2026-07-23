@@ -96,7 +96,10 @@ func (rh *routerHealth) check(ctx context.Context) {
 
 	// 1. Check Envoy
 	{
-		healthy, msg := rh.checkEnvoy(ctx)
+		healthy, msg := true, "Skipped (direct HTTP proxy)"
+		if !rh.cfg.DirectHTTPProxy {
+			healthy, msg = rh.checkEnvoy(ctx)
+		}
 		if healthy {
 			rh.report.Envoy.Healthy = true
 			rh.report.Envoy.Message = msg

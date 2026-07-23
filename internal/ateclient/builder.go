@@ -90,13 +90,37 @@ func NewClient(ctx context.Context, kubeconfigPath, k8sContext, endpoint string,
 	return cli, nil
 }
 
+// NewClientWithBearerToken creates a direct endpoint client using an explicit
+// bearer token. This is mainly useful for callers that establish their own
+// port-forward tunnel.
+func NewClientWithBearerToken(ctx context.Context, endpoint, token string, traceEnabled bool) (*Client, error) {
+	tp, err := initTracing(ctx, traceEnabled)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize tracing: %w", err)
+	}
+	cli, err := dialDirectWithBearerToken(endpoint, token, traceEnabled)
+	if err != nil {
+		_ = tp.Shutdown(ctx)
+		return nil, err
+	}
+	cli.tracerProvider = tp
+	return cli, nil
+}
+
 func dialDirect(kubeconfigPath, k8sContext, endpoint string, traceEnabled bool) (*Client, error) {
+	return dialDirectWithBearerToken(endpoint, "", traceEnabled)
+}
+
+func dialDirectWithBearerToken(endpoint, token string, traceEnabled bool) (*Client, error) {
 	// Always assume TLS to match production behavior
 	creds := credentials.NewTLS(&tls.Config{InsecureSkipVerify: true})
 
 	var opts []grpc.DialOption
 	opts = append(opts, grpc.WithTransportCredentials(creds))
 	opts = append(opts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
+	if token != "" {
+		opts = append(opts, grpc.WithPerRPCCredentials(bearerTokenCreds(token)))
+	}
 
 	if traceEnabled {
 		opts = append(opts, grpc.WithUnaryInterceptor(newTraceInterceptor()))

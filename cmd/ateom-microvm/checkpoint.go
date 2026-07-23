@@ -20,8 +20,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateom-microvm/internal/ch"
@@ -69,8 +71,30 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		return nil, fmt.Errorf("while pausing guest: %w", err)
 	}
 	dPause := time.Since(tPause)
+	resumeOnReturn := req.GetPreserveRunning()
+	if resumeOnReturn {
+		defer func() {
+			if !resumeOnReturn {
+				return
+			}
+			resumeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := client.Resume(resumeCtx); err != nil {
+				slog.ErrorContext(ctx, "Failed to resume guest after preserve-running checkpoint", slog.Any("err", err))
+			}
+		}()
+	}
 
 	checkpointDir := ateompath.CheckpointStateDir(atespace, name)
+	if directDir, ok, err := directSnapshotCheckpointDir(req.GetSnapshotUriPrefix()); err != nil {
+		return nil, err
+	} else if ok {
+		checkpointDir = directDir
+		slog.InfoContext(ctx, "Using direct SnapshotFS checkpoint directory",
+			slog.String("id", name),
+			slog.String("dir", checkpointDir),
+			slog.String("snapshot_uri_prefix", req.GetSnapshotUriPrefix()))
+	}
 	// Start from a clean dir so CH's snapshot files are the only contents.
 	if err := os.RemoveAll(checkpointDir); err != nil {
 		return nil, fmt.Errorf("while clearing checkpoint dir %q: %w", checkpointDir, err)
@@ -108,6 +132,9 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// snapshot is self-contained and re-restorable. (A cold-run actor has no restore
 	// source and its snapshot is already complete — no merge.)
 	if ra != nil && ra.restoreSourceDir != "" {
+		if req.GetPreserveRunning() {
+			return nil, fmt.Errorf("preserve-running checkpoint is not supported for OnDemand-restored microVMs")
+		}
 		base := filepath.Join(ra.restoreSourceDir, "memory-ranges")
 		delta := filepath.Join(checkpointDir, "memory-ranges")
 		tMerge := time.Now()
@@ -132,6 +159,19 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	if err != nil {
 		return nil, fmt.Errorf("while listing snapshot files: %w", err)
 	}
+	if req.GetPreserveRunning() {
+		resumeOnReturn = false
+		tResume := time.Now()
+		if err := client.Resume(ctx); err != nil {
+			return nil, fmt.Errorf("while resuming guest after snapshot: %w", err)
+		}
+		s.actorLogger.EmitLifecycleLog("Actor checkpointed", atespace, name, templateNS, templateName)
+		slog.InfoContext(ctx, "Actor checkpointed without teardown", slog.String("id", name), slog.Any("snapshot_files", snapshotFiles),
+			slog.Duration("pause", dPause),
+			slog.Duration("snapshot", dSnapshot),
+			slog.Duration("resume", time.Since(tResume)))
+		return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
+	}
 
 	// Tear down: the actor returns to "available". Best-effort; the snapshot is
 	// already on disk for atelet to ship.
@@ -150,6 +190,29 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 		slog.Duration("pause", dPause),
 		slog.Duration("snapshot", dSnapshot), slog.Duration("teardown", dTeardown))
 	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
+}
+
+func directSnapshotCheckpointDir(snapshotURIPrefix string) (string, bool, error) {
+	if os.Getenv("ATE_SNAPSHOT_DIRECT_CHECKPOINT") != "1" || strings.TrimSpace(snapshotURIPrefix) == "" {
+		return "", false, nil
+	}
+	root := strings.TrimSpace(os.Getenv("ATE_SNAPSHOT_FS_ROOT"))
+	if root == "" {
+		root = filepath.Join(ateompath.BasePath, "snapshotfs")
+	}
+	parsed, err := url.Parse(snapshotURIPrefix)
+	if err != nil {
+		return "", false, fmt.Errorf("while parsing snapshot URI prefix %q: %w", snapshotURIPrefix, err)
+	}
+	if parsed.Host == "" {
+		return "", false, fmt.Errorf("snapshot URI prefix %q missing bucket", snapshotURIPrefix)
+	}
+	object := strings.TrimPrefix(parsed.Path, "/")
+	cleanObject := filepath.Clean(object)
+	if cleanObject == "." || cleanObject == ".." || strings.HasPrefix(cleanObject, "../") || filepath.IsAbs(cleanObject) {
+		return "", false, fmt.Errorf("unsafe snapshot URI object path %q", object)
+	}
+	return filepath.Join(root, parsed.Host, cleanObject), true, nil
 }
 
 // listFiles returns the (relative) names of regular files directly under dir.

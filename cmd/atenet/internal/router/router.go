@@ -64,22 +64,23 @@ func init() {
 
 // RouterConfig holds deployment setup and endpoint options for the router node instance.
 type RouterConfig struct {
-	Standalone     bool
-	Namespace      string
-	Kubeconfig     string
-	AteapiAddr     string
-	HttpPort       int
-	XdsPort        int
-	ExtprocPort    int
-	ExtprocAddr    string
-	EnvoyImage     string
-	TemplatesFile  string
-	StatusPort     int
-	HealthInterval time.Duration
-	HttpsPort      int
-	EnvoyCertPath  string
-	LogLevel       string
-	MetricsAddr    string
+	Standalone      bool
+	Namespace       string
+	Kubeconfig      string
+	AteapiAddr      string
+	HttpPort        int
+	XdsPort         int
+	ExtprocPort     int
+	ExtprocAddr     string
+	EnvoyImage      string
+	TemplatesFile   string
+	StatusPort      int
+	HealthInterval  time.Duration
+	HttpsPort       int
+	EnvoyCertPath   string
+	LogLevel        string
+	MetricsAddr     string
+	DirectHTTPProxy bool
 	// OtlpCollectorAddress is the host:port of the OTLP gRPC collector that
 	// Envoy reports tracing spans to. Empty disables Envoy-side tracing.
 	OtlpCollectorAddress string
@@ -101,6 +102,7 @@ type RouterServer struct {
 	extprocSrv *ExtProcServer
 	health     *routerHealth
 	atStore    atStore
+	inflight   *inFlightTracker
 }
 
 func NewRouterServer(cfg RouterConfig) (*RouterServer, error) {
@@ -146,6 +148,7 @@ func NewRouterServer(cfg RouterConfig) (*RouterServer, error) {
 		k8sClient: k8sClient,
 		clientset: clientset,
 		atStore:   store,
+		inflight:  newInFlightTracker(),
 	}, nil
 }
 
@@ -244,6 +247,11 @@ func (s *RouterServer) Run(ctx context.Context) error {
 			return fmt.Errorf("failed to create route-duration histogram: %w", err)
 		}
 		s.extprocSrv = NewExtProcServer(s.cfg.ExtprocPort, s.apiClient, routeDuration)
+	}
+	if s.cfg.DirectHTTPProxy {
+		g.Go(func() error {
+			return s.serveDirectHTTPProxy(ctx)
+		})
 	}
 	ctrl := NewController(s.k8sClient, s.clientset, s.cfg, xdsSrv, s.extprocSrv)
 

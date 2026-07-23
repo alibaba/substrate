@@ -15,6 +15,7 @@
 package router
 
 import (
+	"errors"
 	"fmt"
 
 	envoy_type "github.com/envoyproxy/go-control-plane/envoy/type/v3"
@@ -89,4 +90,12 @@ func mapResumeError(actorName string, err error) error {
 		re.msg = fmt.Sprintf("error resuming actor %q", actorName)
 	}
 	return re
+}
+
+func mapRouteError(actorName string, err error) error {
+	var reqErr *reqError
+	if errors.As(err, &reqErr) {
+		return err
+	}
+	return mapResumeError(actorName, err)
 }

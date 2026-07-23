@@ -35,20 +35,24 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Control_GetActor_FullMethodName       = "/ateapi.Control/GetActor"
-	Control_CreateActor_FullMethodName    = "/ateapi.Control/CreateActor"
-	Control_UpdateActor_FullMethodName    = "/ateapi.Control/UpdateActor"
-	Control_SuspendActor_FullMethodName   = "/ateapi.Control/SuspendActor"
-	Control_PauseActor_FullMethodName     = "/ateapi.Control/PauseActor"
-	Control_ResumeActor_FullMethodName    = "/ateapi.Control/ResumeActor"
-	Control_DeleteActor_FullMethodName    = "/ateapi.Control/DeleteActor"
-	Control_ListWorkers_FullMethodName    = "/ateapi.Control/ListWorkers"
-	Control_ListActors_FullMethodName     = "/ateapi.Control/ListActors"
-	Control_CreateAtespace_FullMethodName = "/ateapi.Control/CreateAtespace"
-	Control_GetAtespace_FullMethodName    = "/ateapi.Control/GetAtespace"
-	Control_ListAtespaces_FullMethodName  = "/ateapi.Control/ListAtespaces"
-	Control_DeleteAtespace_FullMethodName = "/ateapi.Control/DeleteAtespace"
-	Control_DebugClear_FullMethodName     = "/ateapi.Control/DebugClear"
+	Control_GetActor_FullMethodName              = "/ateapi.Control/GetActor"
+	Control_CreateActor_FullMethodName           = "/ateapi.Control/CreateActor"
+	Control_UpdateActor_FullMethodName           = "/ateapi.Control/UpdateActor"
+	Control_SuspendActor_FullMethodName          = "/ateapi.Control/SuspendActor"
+	Control_PauseActor_FullMethodName            = "/ateapi.Control/PauseActor"
+	Control_ResumeActor_FullMethodName           = "/ateapi.Control/ResumeActor"
+	Control_PrepareActorMigration_FullMethodName = "/ateapi.Control/PrepareActorMigration"
+	Control_CommitActorMigration_FullMethodName  = "/ateapi.Control/CommitActorMigration"
+	Control_AbortActorMigration_FullMethodName   = "/ateapi.Control/AbortActorMigration"
+	Control_GetActorRoute_FullMethodName         = "/ateapi.Control/GetActorRoute"
+	Control_DeleteActor_FullMethodName           = "/ateapi.Control/DeleteActor"
+	Control_ListWorkers_FullMethodName           = "/ateapi.Control/ListWorkers"
+	Control_ListActors_FullMethodName            = "/ateapi.Control/ListActors"
+	Control_CreateAtespace_FullMethodName        = "/ateapi.Control/CreateAtespace"
+	Control_GetAtespace_FullMethodName           = "/ateapi.Control/GetAtespace"
+	Control_ListAtespaces_FullMethodName         = "/ateapi.Control/ListAtespaces"
+	Control_DeleteAtespace_FullMethodName        = "/ateapi.Control/DeleteAtespace"
+	Control_DebugClear_FullMethodName            = "/ateapi.Control/DebugClear"
 )
 
 // ControlClient is the client API for Control service.
@@ -69,6 +73,16 @@ type ControlClient interface {
 	PauseActor(ctx context.Context, in *PauseActorRequest, opts ...grpc.CallOption) (*PauseActorResponse, error)
 	// Resume an actor from its latest snapshot.
 	ResumeActor(ctx context.Context, in *ResumeActorRequest, opts ...grpc.CallOption) (*ResumeActorResponse, error)
+	// Prepare a target worker for request-level hot migration while the source
+	// keeps serving.
+	PrepareActorMigration(ctx context.Context, in *PrepareActorMigrationRequest, opts ...grpc.CallOption) (*PrepareActorMigrationResponse, error)
+	// Commit a prepared migration by draining the source, finalizing state, and
+	// switching the route.
+	CommitActorMigration(ctx context.Context, in *CommitActorMigrationRequest, opts ...grpc.CallOption) (*CommitActorMigrationResponse, error)
+	// Abort a prepared migration and keep the actor routed to its source worker.
+	AbortActorMigration(ctx context.Context, in *AbortActorMigrationRequest, opts ...grpc.CallOption) (*AbortActorMigrationResponse, error)
+	// Return the router-visible route state for an actor.
+	GetActorRoute(ctx context.Context, in *GetActorRouteRequest, opts ...grpc.CallOption) (*GetActorRouteResponse, error)
 	// Delete an actor. Only suspended actors can be deleted.
 	DeleteActor(ctx context.Context, in *DeleteActorRequest, opts ...grpc.CallOption) (*Actor, error)
 	// List all workers currently reflected in redis.
@@ -149,6 +163,46 @@ func (c *controlClient) ResumeActor(ctx context.Context, in *ResumeActorRequest,
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ResumeActorResponse)
 	err := c.cc.Invoke(ctx, Control_ResumeActor_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) PrepareActorMigration(ctx context.Context, in *PrepareActorMigrationRequest, opts ...grpc.CallOption) (*PrepareActorMigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareActorMigrationResponse)
+	err := c.cc.Invoke(ctx, Control_PrepareActorMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) CommitActorMigration(ctx context.Context, in *CommitActorMigrationRequest, opts ...grpc.CallOption) (*CommitActorMigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CommitActorMigrationResponse)
+	err := c.cc.Invoke(ctx, Control_CommitActorMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) AbortActorMigration(ctx context.Context, in *AbortActorMigrationRequest, opts ...grpc.CallOption) (*AbortActorMigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AbortActorMigrationResponse)
+	err := c.cc.Invoke(ctx, Control_AbortActorMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlClient) GetActorRoute(ctx context.Context, in *GetActorRouteRequest, opts ...grpc.CallOption) (*GetActorRouteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetActorRouteResponse)
+	err := c.cc.Invoke(ctx, Control_GetActorRoute_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -253,6 +307,16 @@ type ControlServer interface {
 	PauseActor(context.Context, *PauseActorRequest) (*PauseActorResponse, error)
 	// Resume an actor from its latest snapshot.
 	ResumeActor(context.Context, *ResumeActorRequest) (*ResumeActorResponse, error)
+	// Prepare a target worker for request-level hot migration while the source
+	// keeps serving.
+	PrepareActorMigration(context.Context, *PrepareActorMigrationRequest) (*PrepareActorMigrationResponse, error)
+	// Commit a prepared migration by draining the source, finalizing state, and
+	// switching the route.
+	CommitActorMigration(context.Context, *CommitActorMigrationRequest) (*CommitActorMigrationResponse, error)
+	// Abort a prepared migration and keep the actor routed to its source worker.
+	AbortActorMigration(context.Context, *AbortActorMigrationRequest) (*AbortActorMigrationResponse, error)
+	// Return the router-visible route state for an actor.
+	GetActorRoute(context.Context, *GetActorRouteRequest) (*GetActorRouteResponse, error)
 	// Delete an actor. Only suspended actors can be deleted.
 	DeleteActor(context.Context, *DeleteActorRequest) (*Actor, error)
 	// List all workers currently reflected in redis.
@@ -296,6 +360,18 @@ func (UnimplementedControlServer) PauseActor(context.Context, *PauseActorRequest
 }
 func (UnimplementedControlServer) ResumeActor(context.Context, *ResumeActorRequest) (*ResumeActorResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ResumeActor not implemented")
+}
+func (UnimplementedControlServer) PrepareActorMigration(context.Context, *PrepareActorMigrationRequest) (*PrepareActorMigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareActorMigration not implemented")
+}
+func (UnimplementedControlServer) CommitActorMigration(context.Context, *CommitActorMigrationRequest) (*CommitActorMigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CommitActorMigration not implemented")
+}
+func (UnimplementedControlServer) AbortActorMigration(context.Context, *AbortActorMigrationRequest) (*AbortActorMigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AbortActorMigration not implemented")
+}
+func (UnimplementedControlServer) GetActorRoute(context.Context, *GetActorRouteRequest) (*GetActorRouteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetActorRoute not implemented")
 }
 func (UnimplementedControlServer) DeleteActor(context.Context, *DeleteActorRequest) (*Actor, error) {
 	return nil, status.Error(codes.Unimplemented, "method DeleteActor not implemented")
@@ -446,6 +522,78 @@ func _Control_ResumeActor_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ControlServer).ResumeActor(ctx, req.(*ResumeActorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_PrepareActorMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareActorMigrationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).PrepareActorMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_PrepareActorMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).PrepareActorMigration(ctx, req.(*PrepareActorMigrationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_CommitActorMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitActorMigrationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).CommitActorMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_CommitActorMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).CommitActorMigration(ctx, req.(*CommitActorMigrationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_AbortActorMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbortActorMigrationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).AbortActorMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_AbortActorMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).AbortActorMigration(ctx, req.(*AbortActorMigrationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Control_GetActorRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetActorRouteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServer).GetActorRoute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Control_GetActorRoute_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServer).GetActorRoute(ctx, req.(*GetActorRouteRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -624,6 +772,22 @@ var Control_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ResumeActor",
 			Handler:    _Control_ResumeActor_Handler,
+		},
+		{
+			MethodName: "PrepareActorMigration",
+			Handler:    _Control_PrepareActorMigration_Handler,
+		},
+		{
+			MethodName: "CommitActorMigration",
+			Handler:    _Control_CommitActorMigration_Handler,
+		},
+		{
+			MethodName: "AbortActorMigration",
+			Handler:    _Control_AbortActorMigration_Handler,
+		},
+		{
+			MethodName: "GetActorRoute",
+			Handler:    _Control_GetActorRoute_Handler,
 		},
 		{
 			MethodName: "DeleteActor",

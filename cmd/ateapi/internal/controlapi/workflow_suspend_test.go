@@ -17,6 +17,7 @@ package controlapi
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store/ateredis"
@@ -24,6 +25,28 @@ import (
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
 )
+
+func TestActorLockLeaseRenewsDuringLongWorkflow(t *testing.T) {
+	persistence := newTestPersistence(t)
+	w := &ActorWorkflow{store: persistence}
+	ctx, release, err := w.acquireActorLock(context.Background(), "space", "actor", 60*time.Millisecond, 5*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	select {
+	case <-ctx.Done():
+		t.Fatalf("workflow context ended before lease test: %v", ctx.Err())
+	case <-time.After(100 * time.Millisecond):
+	}
+	acquired, err := persistence.AcquireLock(context.Background(), "lock:actor:space:actor", "competitor", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acquired {
+		t.Fatal("competitor acquired a lock that should have been renewed")
+	}
+}
 
 // newTestPersistence returns a store backed by a throwaway miniredis.
 func newTestPersistence(t *testing.T) store.Interface {
@@ -99,5 +122,33 @@ func TestFinalizeSuspendedStep_ReleasesOnlyOwnWorker(t *testing.T) {
 				t.Errorf("worker released = %t, want %t (assignment: %v)", released, tt.wantReleased, stored.GetAssignment())
 			}
 		})
+	}
+}
+
+func TestFinalizeSuspendedStepRecordsExternalCacheNodeHint(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+	worker := &ateapipb.Worker{
+		WorkerNamespace: "worker-ns", WorkerPool: "pool", WorkerPod: "pod-1", NodeName: "node-cached",
+		Assignment: &ateapipb.Assignment{Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: "actor"}},
+	}
+	if err := persistence.CreateWorker(ctx, worker); err != nil {
+		t.Fatal(err)
+	}
+	actor := &ateapipb.Actor{
+		Metadata: &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "actor"}, Status: ateapipb.Actor_STATUS_SUSPENDING,
+		AteomPodNamespace: "worker-ns", AteomPodName: "pod-1", WorkerPoolName: "pool",
+		InProgressSnapshot: "gs://snapshots/actor/1",
+	}
+	if _, err := persistence.CreateActor(ctx, actor); err != nil {
+		t.Fatal(err)
+	}
+	state := &SuspendState{LocalCachePublished: true}
+	if err := (&FinalizeSuspendedStep{store: persistence}).Execute(ctx, &SuspendInput{ActorName: "actor", Atespace: "team-a"}, state); err != nil {
+		t.Fatal(err)
+	}
+	got := state.Actor.GetLatestSnapshotInfo().GetExternal().GetNodeVmsWithLocalCache()
+	if len(got) != 1 || got[0] != "node-cached" {
+		t.Fatalf("external cache node hints = %v, want [node-cached]", got)
 	}
 }

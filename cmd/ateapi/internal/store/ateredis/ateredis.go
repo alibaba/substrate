@@ -822,6 +822,24 @@ func (s *Persistence) AcquireLock(ctx context.Context, key string, value string,
 	return ok, nil
 }
 
+// RenewLock extends a lock only while value still owns it. The compare and
+// expiry update are atomic, preventing a delayed owner from renewing a lock
+// that has already been acquired by somebody else.
+func (s *Persistence) RenewLock(ctx context.Context, key, value string, ttl time.Duration) (bool, error) {
+	var luaRenew = redis.NewScript(`
+		if redis.call("get", KEYS[1]) == ARGV[1] then
+			return redis.call("pexpire", KEYS[1], ARGV[2])
+		else
+			return 0
+		end
+	`)
+	result, err := luaRenew.Run(ctx, s.rdb, []string{key}, value, ttl.Milliseconds()).Int()
+	if err != nil {
+		return false, fmt.Errorf("while renewing lock for %q: %w", key, err)
+	}
+	return result == 1, nil
+}
+
 func (s *Persistence) ReleaseLock(ctx context.Context, key string, value string) error {
 	var luaRelease = redis.NewScript(`
 		if redis.call("get", KEYS[1]) == ARGV[1] then

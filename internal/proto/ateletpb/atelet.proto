@@ -199,9 +199,16 @@ message CheckpointRequest {
 
   // What should be included in the checkpoint.
   SnapshotScope scope = 10;
+
+  // If true, the runtime should resume the workload after capturing the
+  // checkpoint and atelet must not reset the actor's live directories.
+  bool preserve_running = 11;
 }
 
 message CheckpointResponse {
+  // True when atelet atomically published a decoded node-local cache entry for
+  // this external snapshot. The external snapshot remains the source of truth.
+  bool local_cache_published = 1;
 }
 
 message RestoreRequest {

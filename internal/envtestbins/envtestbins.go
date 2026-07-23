@@ -16,12 +16,14 @@
 package envtestbins
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // BinaryAssetsDir resolves the envtest (kubebuilder) binary assets directory,
@@ -37,6 +39,10 @@ import (
 // ... from archive". Serializing the first download makes later callers hit a
 // warm cache (a no-op path lookup).
 func BinaryAssetsDir() (string, error) {
+	if assets := os.Getenv("KUBEBUILDER_ASSETS"); assets != "" {
+		return assets, nil
+	}
+
 	root, err := repoRoot()
 	if err != nil {
 		return "", err
@@ -48,11 +54,16 @@ func BinaryAssetsDir() (string, error) {
 	}
 	defer unlock()
 
-	cmd := exec.Command("bash", filepath.Join(root, "hack", "run-tool.sh"), "setup-envtest", "use", "--print", "path")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", filepath.Join(root, "hack", "run-tool.sh"), "setup-envtest", "use", "--print", "path")
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
 	if err != nil {
+		if ctx.Err() != nil {
+			return "", fmt.Errorf("setup-envtest timed out: %w (stderr: %s)", ctx.Err(), stderr.String())
+		}
 		return "", fmt.Errorf("setup-envtest: %w (stderr: %s)", err, stderr.String())
 	}
 	return strings.TrimSpace(string(out)), nil

@@ -26,6 +26,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -60,6 +62,130 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/lru"
 )
+
+type snapshotStageSummary struct {
+	mu                   sync.Mutex
+	fileCount            int64
+	logicalBytes         int64
+	storedBytes          int64
+	writtenBytes         int64
+	populatedBytes       int64
+	ioTime               time.Duration
+	sparseScanDuration   time.Duration
+	extentCopyDuration   time.Duration
+	compressionDuration  time.Duration
+	storageWriteDuration time.Duration
+	closeDuration        time.Duration
+	syncDuration         time.Duration
+	publishDuration      time.Duration
+	prepareDuration      time.Duration
+	fileChunks           map[string][]ategcs.SnapshotFSRawChunk
+}
+
+type snapshotStageResult struct {
+	FileCount            int64
+	LogicalBytes         int64
+	StoredBytes          int64
+	WrittenBytes         int64
+	PopulatedBytes       int64
+	IOTime               time.Duration
+	SparseScanDuration   time.Duration
+	ExtentCopyDuration   time.Duration
+	CompressionDuration  time.Duration
+	StorageWriteDuration time.Duration
+	CloseDuration        time.Duration
+	SyncDuration         time.Duration
+	PublishDuration      time.Duration
+	PrepareDuration      time.Duration
+	WallTime             time.Duration
+}
+
+func (s *snapshotStageSummary) add(result ategcs.SnapshotIOResult) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fileCount++
+	s.logicalBytes += result.LogicalBytes
+	s.storedBytes += result.StoredBytes
+	s.writtenBytes += result.WrittenBytes
+	s.populatedBytes += result.PopulatedBytes
+	s.ioTime += result.Duration
+	s.sparseScanDuration += result.SparseScanDuration
+	s.extentCopyDuration += result.ExtentCopyDuration
+	s.compressionDuration += result.CompressionDuration
+	s.storageWriteDuration += result.StorageWriteDuration
+	s.closeDuration += result.CloseDuration
+	s.syncDuration += result.SyncDuration
+	s.publishDuration += result.PublishDuration
+	s.prepareDuration += result.PrepareDuration
+}
+
+func (s *snapshotStageSummary) addChunkedFile(fileName string, chunks []ategcs.SnapshotFSRawChunk) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fileChunks == nil {
+		s.fileChunks = make(map[string][]ategcs.SnapshotFSRawChunk)
+	}
+	s.fileChunks[fileName] = append([]ategcs.SnapshotFSRawChunk(nil), chunks...)
+}
+
+func (s *snapshotStageSummary) chunks() map[string][]ategcs.SnapshotFSRawChunk {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.fileChunks) == 0 {
+		return nil
+	}
+	out := make(map[string][]ategcs.SnapshotFSRawChunk, len(s.fileChunks))
+	for fileName, chunks := range s.fileChunks {
+		out[fileName] = append([]ategcs.SnapshotFSRawChunk(nil), chunks...)
+	}
+	return out
+}
+
+func (s *snapshotStageSummary) finish(started time.Time) snapshotStageResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return snapshotStageResult{
+		FileCount:            s.fileCount,
+		LogicalBytes:         s.logicalBytes,
+		StoredBytes:          s.storedBytes,
+		WrittenBytes:         s.writtenBytes,
+		PopulatedBytes:       s.populatedBytes,
+		IOTime:               s.ioTime,
+		SparseScanDuration:   s.sparseScanDuration,
+		ExtentCopyDuration:   s.extentCopyDuration,
+		CompressionDuration:  s.compressionDuration,
+		StorageWriteDuration: s.storageWriteDuration,
+		CloseDuration:        s.closeDuration,
+		SyncDuration:         s.syncDuration,
+		PublishDuration:      s.publishDuration,
+		PrepareDuration:      s.prepareDuration,
+		WallTime:             time.Since(started),
+	}
+}
+
+func snapshotFSRawChunkBytes() int64 {
+	raw := strings.TrimSpace(os.Getenv("ATE_SNAPSHOT_RAW_CHUNK_BYTES"))
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 1<<20 || n > 4<<30 {
+		return 0
+	}
+	return n
+}
+
+func snapshotFSRawChunkConcurrency() int {
+	raw := strings.TrimSpace(os.Getenv("ATE_SNAPSHOT_RAW_CHUNK_CONCURRENCY"))
+	if raw == "" {
+		return 1
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 || n > 64 {
+		return 1
+	}
+	return n
+}
 
 var (
 	port              = pflag.Int("port", 8085, "The port to listen on")
@@ -306,6 +432,7 @@ func recordSnapshotSize(ctx context.Context, kind, path, atNamespace, atName str
 }
 
 func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRequest) (*ateletpb.CheckpointResponse, error) {
+	tStart := time.Now()
 	if err := validateCheckpointRequest(req); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
@@ -335,31 +462,57 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	// Tell ateom to take the checkpoint and delete containers. ateom reports the
 	// exact files it wrote so we ship precisely that set (gVisor's image files,
 	// cloud-hypervisor's snapshot set, ...) rather than a hardcoded list.
+	tRuntime := time.Now()
 	resp, err := client.CheckpointWorkload(ctx, &ateompb.CheckpointWorkloadRequest{
 		Atespace:               atespace,
 		ActorName:              actorName,
 		ActorTemplateNamespace: req.GetActorTemplateNamespace(),
 		ActorTemplateName:      req.GetActorTemplateName(),
 		RunscPath:              runscPathFor(assetPaths),
+		SnapshotUriPrefix:      externalSnapshotURIPrefix(req),
 		RuntimeAssetPaths:      assetPaths,
 		Spec:                   buildAteomWorkloadSpec(req.GetSpec()),
 		Scope:                  toAteomSnapshotScope(req.GetScope()),
+		PreserveRunning:        req.GetPreserveRunning(),
 	})
 	if err != nil {
 		// TODO: Ateom should classify checkpoint failures, and set "should-crash"
 		// in the metadata if the error is not retriable.
 		return nil, fmt.Errorf("while calling ateom.CheckpointWorkload: %w", err)
 	}
+	dRuntime := time.Since(tRuntime)
 	sandboxRec.SnapshotFiles = resp.GetSnapshotFiles()
+	sandboxRec.SnapshotFormat = configuredSnapshotFormat()
 	if len(sandboxRec.SnapshotFiles) == 0 {
 		return nil, ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonInvalidCheckpointResult, ateerrors.ActorCrashedMetadata(), errors.New("ateom reported no snapshot files for checkpoint"))
 	}
+	if directCheckpointDir, ok, err := directCheckpointPath(req, sandboxRec); err != nil {
+		return nil, ateerrors.CrashIfReason(ctx, err, ateerrors.ReasonInvalidObjectURL, ateerrors.ReasonTerminalFileSystemError)
+	} else if ok {
+		checkpointDir = directCheckpointDir
+	}
 
+	logicalBytes, sizeErr := snapshotLogicalBytes(checkpointDir, sandboxRec.SnapshotFiles)
+	if sizeErr != nil {
+		return nil, sizeErr
+	}
+	tStorage := time.Now()
+	cachePublished := false
+	var checkpointUpload snapshotStageResult
 	switch req.GetType() {
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
 		// TODO(#362): Because we do not cache the external snapshot files when upload fails, we have to mark the Actor as CRASHED.
-		if err := s.uploadExternalCheckpoint(ctx, req, checkpointDir, sandboxRec); err != nil {
+		manifest, uploadSummary, err := s.uploadExternalCheckpoint(ctx, req, checkpointDir, sandboxRec)
+		if err != nil {
 			return nil, ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonFaileSaveSnapshot, ateerrors.ActorCrashedMetadata(), fmt.Errorf("%w: while uploading external snapshot: %w", ateerrors.ReasonFaileSaveSnapshot, err))
+		}
+		checkpointUpload = uploadSummary
+		if cache := configuredSnapshotCache(); cache != nil && sandboxRec.snapshotFormat() == snapshotFormatSparseZstdV1 {
+			cachePublished, err = cache.publish(req.GetExternalConfig().GetSnapshotUriPrefix(), checkpointDir, sandboxRec.SnapshotFiles, manifest)
+			if err != nil {
+				slog.WarnContext(ctx, "Failed to publish decoded snapshot cache; external snapshot remains available", "err", err)
+				cachePublished = false
+			}
 		}
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
 		if err := s.moveLocalCheckpoint(ctx, req, checkpointDir, sandboxRec); err != nil {
@@ -368,13 +521,147 @@ func (s *AteomHerder) Checkpoint(ctx context.Context, req *ateletpb.CheckpointRe
 	default:
 		return nil, fmt.Errorf("unexpected checkpoint type: %v", req.GetType())
 	}
+	dStorage := time.Since(tStorage)
 
-	// Note: we do not crash the actor if resetting the directory fails.
-	if err := resetActorDirs(atespace, actorName); err != nil {
-		return nil, fmt.Errorf("while resetting actor dirs: %w", err)
+	if !req.GetPreserveRunning() {
+		// Note: we do not crash the actor if resetting the directory fails.
+		if err := resetActorDirs(atespace, actorName); err != nil {
+			return nil, fmt.Errorf("while resetting actor dirs: %w", err)
+		}
 	}
 
-	return &ateletpb.CheckpointResponse{}, nil
+	slog.InfoContext(ctx, "Checkpoint timing breakdown",
+		slog.String("actor", actorName),
+		slog.Duration("runsc_checkpoint", dRuntime),
+		slog.Duration("snapshot_storage", dStorage),
+		slog.Int64("logical_bytes", logicalBytes),
+		slog.Int64("checkpoint_file_count", checkpointUpload.FileCount),
+		slog.Int64("checkpoint_populated_bytes", checkpointUpload.PopulatedBytes),
+		slog.Int64("checkpoint_compressed_bytes", checkpointUpload.StoredBytes),
+		slog.Duration("checkpoint_sparse_scan", checkpointUpload.SparseScanDuration),
+		slog.Duration("checkpoint_extent_copy", checkpointUpload.ExtentCopyDuration),
+		slog.Duration("checkpoint_prepare", checkpointUpload.PrepareDuration),
+		slog.Duration("checkpoint_compression", checkpointUpload.CompressionDuration),
+		slog.Duration("checkpoint_storage_write", checkpointUpload.StorageWriteDuration),
+		slog.Duration("checkpoint_close", checkpointUpload.CloseDuration),
+		slog.Duration("checkpoint_sync", checkpointUpload.SyncDuration),
+		slog.Duration("checkpoint_publish", checkpointUpload.PublishDuration),
+		slog.Duration("checkpoint_file_io_sum", checkpointUpload.IOTime),
+		slog.Duration("checkpoint_file_wall", checkpointUpload.WallTime),
+		slog.Duration("total", time.Since(tStart)))
+
+	return &ateletpb.CheckpointResponse{LocalCachePublished: cachePublished}, nil
+}
+
+func snapshotLogicalBytes(dir string, files []string) (int64, error) {
+	var total int64
+	for _, name := range files {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			return 0, fmt.Errorf("while stating snapshot file %q: %w", name, err)
+		}
+		total += info.Size()
+	}
+	return total, nil
+}
+
+func directRestorePath(prefix string, rec *sandboxAssetsRecord) (string, bool, error) {
+	if os.Getenv("ATE_SNAPSHOT_DIRECT_RESTORE") != "1" || rec.snapshotFormat() != snapshotFormatRawSparseV1 {
+		return "", false, nil
+	}
+	if len(rec.SnapshotFileChunks) > 0 {
+		return "", false, nil
+	}
+	manifestPath, err := ategcs.SnapshotFSObjectPath(strings.TrimSuffix(prefix, "/") + "/" + sandboxManifestName)
+	if err != nil {
+		return "", false, err
+	}
+	dir := filepath.Dir(manifestPath)
+	for _, name := range rec.SnapshotFiles {
+		if filepath.Base(name) != name || name == "." {
+			return "", false, fmt.Errorf("unsafe direct-restore snapshot file %q", name)
+		}
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			return "", false, fmt.Errorf("while validating direct-restore file %q: %w", name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return "", false, fmt.Errorf("direct-restore path %q is not a regular file", name)
+		}
+	}
+	return dir, true, nil
+}
+
+func microVMDirectRestoreLinkMinBytes() int64 {
+	const defaultMinBytes int64 = 64 << 20
+	raw := os.Getenv("ATE_MICROVM_DIRECT_RESTORE_LINK_MIN_BYTES")
+	if raw == "" {
+		return defaultMinBytes
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return defaultMinBytes
+	}
+	return n
+}
+
+func stageMicroVMDirectRestore(checkpointDir, snapshotDir string, files []string) error {
+	if err := os.RemoveAll(checkpointDir); err != nil {
+		return fmt.Errorf("while replacing microvm direct restore directory: %w", err)
+	}
+	if err := os.MkdirAll(checkpointDir, 0o700); err != nil {
+		return fmt.Errorf("while creating microvm direct restore directory: %w", err)
+	}
+
+	linkMinBytes := microVMDirectRestoreLinkMinBytes()
+	for _, name := range files {
+		if filepath.Base(name) != name || name == "." {
+			return fmt.Errorf("unsafe direct-restore snapshot file %q", name)
+		}
+		src := filepath.Join(snapshotDir, name)
+		dst := filepath.Join(checkpointDir, name)
+		info, err := os.Stat(src)
+		if err != nil {
+			return fmt.Errorf("while stating microvm direct-restore file %q: %w", name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("microvm direct-restore path %q is not a regular file", name)
+		}
+		if info.Size() >= linkMinBytes {
+			if err := os.Symlink(src, dst); err != nil {
+				return fmt.Errorf("while linking microvm direct-restore file %q: %w", name, err)
+			}
+			continue
+		}
+		if _, err := copyFile(src, dst); err != nil {
+			return fmt.Errorf("while copying microvm direct-restore file %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func directCheckpointPath(req *ateletpb.CheckpointRequest, rec *sandboxAssetsRecord) (string, bool, error) {
+	if os.Getenv("ATE_SNAPSHOT_DIRECT_CHECKPOINT") != "1" || req.GetType() != ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL || rec.snapshotFormat() != snapshotFormatRawSparseV1 {
+		return "", false, nil
+	}
+	manifestPath, err := ategcs.SnapshotFSObjectPath(strings.TrimSuffix(req.GetExternalConfig().GetSnapshotUriPrefix(), "/") + "/" + sandboxManifestName)
+	if err != nil {
+		return "", false, err
+	}
+	dir := filepath.Dir(manifestPath)
+	for _, name := range rec.SnapshotFiles {
+		if filepath.Base(name) != name || name == "." {
+			return "", false, fmt.Errorf("unsafe direct-checkpoint snapshot file %q", name)
+		}
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			return "", false, fmt.Errorf("while validating direct-checkpoint file %q: %w", name, err)
+		}
+		if !info.Mode().IsRegular() {
+			return "", false, fmt.Errorf("direct-checkpoint path %q is not a regular file", name)
+		}
+	}
+	return dir, true, nil
 }
 
 func toAteomSnapshotScope(scope ateletpb.SnapshotScope) ateompb.SnapshotScope {
@@ -417,36 +704,177 @@ func (s *AteomHerder) moveLocalCheckpoint(ctx context.Context, req *ateletpb.Che
 	return nil
 }
 
-func (s *AteomHerder) uploadExternalCheckpoint(ctx context.Context, req *ateletpb.CheckpointRequest, checkpointDir string, rec *sandboxAssetsRecord) error {
+func (s *AteomHerder) uploadExternalCheckpoint(ctx context.Context, req *ateletpb.CheckpointRequest, checkpointDir string, rec *sandboxAssetsRecord) ([]byte, snapshotStageResult, error) {
 	prefix := strings.TrimSuffix(req.GetExternalConfig().GetSnapshotUriPrefix(), "/")
+
+	if rec.snapshotFormat() == snapshotFormatRawSparseV1 && ategcs.SnapshotFSConfigured() {
+		alreadyPublished, err := checkpointAlreadyOnSnapshotFS(prefix, checkpointDir)
+		if err != nil {
+			return nil, snapshotStageResult{}, err
+		}
+		if alreadyPublished {
+			started := time.Now()
+			var summary snapshotStageSummary
+			for _, fileName := range rec.SnapshotFiles {
+				result, err := localSnapshotFileResult(filepath.Join(checkpointDir, fileName))
+				if err != nil {
+					return nil, snapshotStageResult{}, fmt.Errorf("while recording already-published raw snapshot %s: %w", fileName, err)
+				}
+				summary.add(result)
+				slog.InfoContext(ctx, "Checkpoint file timing",
+					slog.String("file", fileName),
+					slog.String("format", rec.snapshotFormat()),
+					slog.Bool("already_on_snapshot_fs", true),
+					slog.Int64("logical_bytes", result.LogicalBytes),
+					slog.Int64("populated_bytes", result.PopulatedBytes),
+					slog.Int64("stored_bytes", result.StoredBytes),
+					slog.Int64("written_bytes", result.WrittenBytes),
+					slog.Duration("total", result.Duration))
+			}
+			manifest, err := json.Marshal(rec)
+			if err != nil {
+				return nil, snapshotStageResult{}, fmt.Errorf("while marshaling snapshot manifest: %w", err)
+			}
+			if err := ategcs.SendBytesToGCS(ctx, s.gcsClient, prefix+"/"+sandboxManifestName, manifest); err != nil {
+				return nil, snapshotStageResult{}, fmt.Errorf("while uploading snapshot manifest: %w", err)
+			}
+			return manifest, summary.finish(started), nil
+		}
+	}
 
 	// Upload exactly the files ateom reported (each zstd-compressed).
 	g, gCtx := errgroup.WithContext(ctx)
+	started := time.Now()
+	var summary snapshotStageSummary
 	for _, fileName := range rec.SnapshotFiles {
 		fileName := fileName
 		local := filepath.Join(checkpointDir, fileName)
 		recordSnapshotSize(ctx, strings.TrimSuffix(fileName, ".img"), local, req.GetActorTemplateNamespace(), req.GetActorTemplateName())
 		g.Go(func() error {
-			if err := ategcs.SendLocalFileToGCSWithZstd(gCtx, s.gcsClient, prefix+"/"+fileName+".zstd", local); err != nil {
-				return fmt.Errorf("while uploading %s to GCS: %w", fileName, err)
+			var result ategcs.SnapshotIOResult
+			if rec.snapshotFormat() == snapshotFormatRawSparseV1 {
+				var err error
+				if ategcs.SnapshotFSConfigured() {
+					chunkBytes := snapshotFSRawChunkBytes()
+					if chunkBytes > 0 {
+						info, statErr := os.Stat(local)
+						if statErr != nil {
+							return fmt.Errorf("while stating raw snapshot %s: %w", fileName, statErr)
+						}
+						if info.Size() > chunkBytes {
+							var chunks []ategcs.SnapshotFSRawChunk
+							chunks, result, err = ategcs.SendLocalFileToSnapshotFSRawChunked(gCtx, prefix+"/"+fileName, local, chunkBytes, snapshotFSRawChunkConcurrency())
+							if err == nil {
+								summary.addChunkedFile(fileName, chunks)
+							}
+						} else {
+							result, err = ategcs.SendLocalFileToSnapshotFSRaw(gCtx, prefix+"/"+fileName, local)
+						}
+					} else {
+						result, err = ategcs.SendLocalFileToSnapshotFSRaw(gCtx, prefix+"/"+fileName, local)
+					}
+				} else {
+					chunkBytes := snapshotFSRawChunkBytes()
+					if chunkBytes > 0 {
+						info, statErr := os.Stat(local)
+						if statErr != nil {
+							return fmt.Errorf("while stating raw snapshot %s: %w", fileName, statErr)
+						}
+						if info.Size() > chunkBytes {
+							var chunks []ategcs.SnapshotFSRawChunk
+							chunks, result, err = ategcs.SendLocalFileToGCSRawChunked(gCtx, s.gcsClient, prefix+"/"+fileName, local, chunkBytes, snapshotFSRawChunkConcurrency())
+							if err == nil {
+								summary.addChunkedFile(fileName, chunks)
+							}
+						} else {
+							result, err = ategcs.SendLocalFileToGCSRawResult(gCtx, s.gcsClient, prefix+"/"+fileName, local)
+						}
+					} else {
+						result, err = ategcs.SendLocalFileToGCSRawResult(gCtx, s.gcsClient, prefix+"/"+fileName, local)
+					}
+				}
+				if err != nil {
+					return fmt.Errorf("while publishing raw snapshot %s: %w", fileName, err)
+				}
+			} else {
+				var err error
+				result, err = ategcs.SendLocalFileToGCSWithZstdResult(gCtx, s.gcsClient, prefix+"/"+fileName+".zstd", local)
+				if err != nil {
+					return fmt.Errorf("while uploading %s to GCS: %w", fileName, err)
+				}
 			}
+			summary.add(result)
+			slog.InfoContext(gCtx, "Checkpoint file timing",
+				slog.String("file", fileName),
+				slog.String("format", rec.snapshotFormat()),
+				slog.Bool("sparse", result.Sparse),
+				slog.Int64("logical_bytes", result.LogicalBytes),
+				slog.Int64("populated_bytes", result.PopulatedBytes),
+				slog.Int64("stored_bytes", result.StoredBytes),
+				slog.Int64("written_bytes", result.WrittenBytes),
+				slog.Duration("sparse_scan", result.SparseScanDuration),
+				slog.Duration("extent_copy", result.ExtentCopyDuration),
+				slog.Duration("prepare", result.PrepareDuration),
+				slog.Duration("compression", result.CompressionDuration),
+				slog.Duration("storage_write", result.StorageWriteDuration),
+				slog.Duration("close", result.CloseDuration),
+				slog.Duration("sync", result.SyncDuration),
+				slog.Duration("publish", result.PublishDuration),
+				slog.Duration("total", result.Duration))
 			return nil
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return err
+		return nil, snapshotStageResult{}, err
+	}
+	uploadSummary := summary.finish(started)
+	if chunks := summary.chunks(); len(chunks) > 0 {
+		rec.SnapshotFileChunks = chunks
 	}
 
 	// Pin the sandbox binaries + snapshot file list into a manifest beside the
 	// images, written last, so a Restore on any node is self-describing.
 	manifest, err := json.Marshal(rec)
 	if err != nil {
-		return fmt.Errorf("while marshaling snapshot manifest: %w", err)
+		return nil, snapshotStageResult{}, fmt.Errorf("while marshaling snapshot manifest: %w", err)
 	}
 	if err := ategcs.SendBytesToGCS(ctx, s.gcsClient, prefix+"/"+sandboxManifestName, manifest); err != nil {
-		return fmt.Errorf("while uploading snapshot manifest: %w", err)
+		return nil, snapshotStageResult{}, fmt.Errorf("while uploading snapshot manifest: %w", err)
 	}
-	return nil
+	return manifest, uploadSummary, nil
+}
+
+func checkpointAlreadyOnSnapshotFS(prefix, checkpointDir string) (bool, error) {
+	manifestPath, err := ategcs.SnapshotFSObjectPath(prefix + "/" + sandboxManifestName)
+	if err != nil {
+		return false, err
+	}
+	return filepath.Clean(checkpointDir) == filepath.Clean(filepath.Dir(manifestPath)), nil
+}
+
+func localSnapshotFileResult(path string) (ategcs.SnapshotIOResult, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return ategcs.SnapshotIOResult{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return ategcs.SnapshotIOResult{}, fmt.Errorf("%s is not a regular file", path)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return ategcs.SnapshotIOResult{}, err
+	}
+	populated := st.Blocks * 512
+	if populated > info.Size() {
+		populated = info.Size()
+	}
+	return ategcs.SnapshotIOResult{
+		LogicalBytes:   info.Size(),
+		PopulatedBytes: populated,
+		StoredBytes:    info.Size(),
+		WrittenBytes:   0,
+		Sparse:         true,
+	}, nil
 }
 
 func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest) (*ateletpb.RestoreResponse, error) {
@@ -474,10 +902,12 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	// request no longer carries the sandbox config). Fetch the (small) manifest
 	// first — both the checkpoint download and the OCI/asset prep below need it.
 	var sandboxRec *sandboxAssetsRecord
+	var manifest []byte
 	switch req.GetType() {
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
 		prefix := req.GetExternalConfig().GetSnapshotUriPrefix()
-		manifest, err := ategcs.FetchFromGCS(ctx, s.gcsClient, strings.TrimSuffix(prefix, "/")+"/"+sandboxManifestName)
+		var err error
+		manifest, err = ategcs.FetchFromGCS(ctx, s.gcsClient, strings.TrimSuffix(prefix, "/")+"/"+sandboxManifestName)
 		if err != nil {
 			return nil, ateerrors.CrashIfReason(ctx, fmt.Errorf("while fetching snapshot manifest: %w", err), ateerrors.ReasonInvalidObjectURL, ateerrors.ReasonFailedGetExternalObject)
 		}
@@ -487,7 +917,8 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
 		localCheckpointDir := ateompath.LocalCheckpointsDir(atespace, actorName)
 		snapshotPrefix := req.GetLocalConfig().GetSnapshotPrefix()
-		manifest, err := os.ReadFile(filepath.Join(localCheckpointDir, snapshotPrefix, sandboxManifestName))
+		var err error
+		manifest, err = os.ReadFile(filepath.Join(localCheckpointDir, snapshotPrefix, sandboxManifestName))
 		if err != nil {
 			if isTerminalFileSystemErr(err) {
 				return nil, ateerrors.NewGRPCError(ctx, codes.DataLoss, ateerrors.ReasonTerminalFileSystemError, ateerrors.ActorCrashedMetadata(), err)
@@ -499,6 +930,40 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		}
 	default:
 		return nil, fmt.Errorf("unexpected checkpoint type: %v", req.GetType())
+	}
+	var directPath string
+	var direct bool
+	if req.GetType() == ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL {
+		var directErr error
+		directPath, direct, directErr = directRestorePath(req.GetExternalConfig().GetSnapshotUriPrefix(), sandboxRec)
+		if directErr != nil {
+			return nil, ateerrors.CrashIfReason(ctx, directErr, ateerrors.ReasonInvalidObjectURL, ateerrors.ReasonTerminalFileSystemError)
+		}
+	}
+	if direct {
+		if sandboxRec.SandboxClass == "microvm" {
+			if err := stageMicroVMDirectRestore(checkpointDir, directPath, sandboxRec.SnapshotFiles); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := os.RemoveAll(checkpointDir); err != nil {
+				return nil, fmt.Errorf("while replacing restore directory for direct restore: %w", err)
+			}
+			if err := os.Symlink(directPath, checkpointDir); err != nil {
+				return nil, fmt.Errorf("while linking direct restore directory: %w", err)
+			}
+		}
+	}
+	cacheHit := false
+	if !direct && req.GetType() == ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL && sandboxRec.snapshotFormat() == snapshotFormatSparseZstdV1 {
+		if cache := configuredSnapshotCache(); cache != nil {
+			var cacheErr error
+			cacheHit, cacheErr = cache.linkRestore(req.GetExternalConfig().GetSnapshotUriPrefix(), checkpointDir, sandboxRec.SnapshotFiles, manifest)
+			if cacheErr != nil {
+				slog.WarnContext(ctx, "Decoded snapshot cache lookup failed; falling back to external snapshot", "err", cacheErr)
+				cacheHit = false
+			}
+		}
 	}
 
 	// Download the memory snapshot and prepare the sandbox assets + OCI bundle
@@ -512,9 +977,13 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
 		t := time.Now()
+		if direct || cacheHit {
+			dDownload = time.Since(t)
+			return nil
+		}
 		switch req.GetType() {
 		case ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL:
-			if err := s.downloadExternalCheckpoint(gctx, req.GetExternalConfig().GetSnapshotUriPrefix(), checkpointDir, sandboxRec.SnapshotFiles); err != nil {
+			if err := s.downloadExternalCheckpoint(gctx, req.GetExternalConfig().GetSnapshotUriPrefix(), checkpointDir, sandboxRec.SnapshotFiles, sandboxRec.snapshotFormat(), sandboxRec.SnapshotFileChunks); err != nil {
 				return ateerrors.CrashIfReason(ctx, err, ateerrors.ReasonFailedGetExternalObject, ateerrors.ReasonInvalidObjectURL, ateerrors.ReasonTerminalFileSystemError)
 			}
 		case ateletpb.CheckpointType_CHECKPOINT_TYPE_LOCAL:
@@ -555,6 +1024,7 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 		ActorTemplateNamespace: req.GetActorTemplateNamespace(),
 		ActorTemplateName:      req.GetActorTemplateName(),
 		RunscPath:              runscPathFor(assetPaths),
+		SnapshotUriPrefix:      externalSnapshotURIPrefix(req),
 		RuntimeAssetPaths:      assetPaths,
 		Spec:                   buildAteomWorkloadSpec(req.GetSpec()),
 		Scope:                  toAteomSnapshotScope(req.GetScope()),
@@ -572,11 +1042,22 @@ func (s *AteomHerder) Restore(ctx context.Context, req *ateletpb.RestoreRequest)
 	}
 
 	slog.InfoContext(ctx, "Restore timing breakdown", slog.String("actor", actorName),
+		slog.Bool("snapshot_cache_hit", cacheHit),
 		slog.Duration("download", dDownload),   // rustfs/GCS fetch + decompress (or local copy)
 		slog.Duration("oci_unpack", dBundles),  // prepareOCIBundles: unpack the OCI image to the bundle
 		slog.Duration("ateom_restore", dAteom), // ateom.RestoreWorkload (see its own breakdown)
 		slog.Duration("total", time.Since(tStart)))
 	return &ateletpb.RestoreResponse{}, nil
+}
+
+func externalSnapshotURIPrefix(req interface {
+	GetType() ateletpb.CheckpointType
+	GetExternalConfig() *ateletpb.ExternalCheckpointConfiguration
+}) string {
+	if req.GetType() != ateletpb.CheckpointType_CHECKPOINT_TYPE_EXTERNAL || req.GetExternalConfig() == nil {
+		return ""
+	}
+	return req.GetExternalConfig().GetSnapshotUriPrefix()
 }
 
 func (s *AteomHerder) copyLocalCheckpoint(ctx context.Context, snapshotPrefix string, srcDir, dstDir string, files []string) error {
@@ -619,13 +1100,37 @@ func copyFile(src, dst string) (int64, error) {
 	return nBytes, err
 }
 
-func (s *AteomHerder) downloadExternalCheckpoint(ctx context.Context, snapshotUriPrefix string, dstDir string, files []string) error {
+func (s *AteomHerder) downloadExternalCheckpoint(ctx context.Context, snapshotUriPrefix string, dstDir string, files []string, format string, chunksByFile map[string][]ategcs.SnapshotFSRawChunk) error {
 	prefix := strings.TrimSuffix(snapshotUriPrefix, "/")
 	g, gCtx := errgroup.WithContext(ctx)
 	for _, fileName := range files {
 		fileName := fileName
 		local := filepath.Join(dstDir, fileName)
 		g.Go(func() error {
+			if format == snapshotFormatRawSparseV1 {
+				if ategcs.SnapshotFSConfigured() {
+					if chunks := chunksByFile[fileName]; len(chunks) > 0 {
+						if _, err := ategcs.FetchLocalFileFromSnapshotFSRawChunked(gCtx, prefix+"/"+fileName, local, chunks, snapshotFSRawChunkConcurrency()); err != nil {
+							return fmt.Errorf("while materializing chunked raw snapshot %s: %w", fileName, err)
+						}
+						return nil
+					}
+					if _, err := ategcs.FetchLocalFileFromSnapshotFSRaw(gCtx, prefix+"/"+fileName, local); err != nil {
+						return fmt.Errorf("while materializing raw snapshot %s: %w", fileName, err)
+					}
+					return nil
+				}
+				if chunks := chunksByFile[fileName]; len(chunks) > 0 {
+					if _, err := ategcs.FetchLocalFileFromGCSRawChunked(gCtx, s.gcsClient, prefix+"/"+fileName, local, chunks, snapshotFSRawChunkConcurrency()); err != nil {
+						return fmt.Errorf("while materializing chunked raw snapshot %s from GCS: %w", fileName, err)
+					}
+					return nil
+				}
+				if _, err := ategcs.FetchLocalFileFromGCSRaw(gCtx, s.gcsClient, prefix+"/"+fileName, local); err != nil {
+					return fmt.Errorf("while downloading raw snapshot %s from GCS: %w", fileName, err)
+				}
+				return nil
+			}
 			if err := ategcs.FetchLocalFileFromGCSWithZstd(gCtx, s.gcsClient, prefix+"/"+fileName+".zstd", local); err != nil {
 				return fmt.Errorf("while downloading %s from GCS: %w", fileName, err)
 			}
@@ -694,7 +1199,7 @@ func (s *AteomHerder) prepareOCIBundles(
 			atespace, actorName,
 			"pause",
 			spec.GetPauseImage(),
-			[]string{"/pause"},
+			nil,
 			nil,
 			annotations,
 			ateompath.AteomNetNSPath(targetAteomUid),

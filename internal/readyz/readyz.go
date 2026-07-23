@@ -39,7 +39,7 @@ import (
 // a few seconds to bind; HTTPClient below is a var so tests can substitute
 // a transport that targets a test server's loopback address.
 const (
-	OverallTimeout   = 30 * time.Second
+	OverallTimeout   = 120 * time.Second
 	RequestTimeout   = 250 * time.Millisecond
 	PollInterval     = 1 * time.Millisecond
 	DefaultPath      = "/readyz"

@@ -192,6 +192,84 @@ func TestSyncer_Lifecycle(t *testing.T) {
 	}
 }
 
+func TestSyncer_RetriesWorkerWhenWorkerPoolCacheLags(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ns := "ns-syncer-cache-lag"
+	podName := "worker-cache-lag-1"
+	poolName := "pool1"
+
+	persistence, cleanup := storetest.SetupTestStore(t)
+	defer cleanup()
+
+	fakeK8s := fake.NewSimpleClientset()
+	workerFactory, workerInformer := WorkerPodInformer(fakeK8s)
+
+	//nolint:staticcheck // NewSimpleClientset is the only available fake clientset for versioned CRDs.
+	fakeAte := atefake.NewSimpleClientset(&atev1alpha1.WorkerPool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      poolName,
+			Namespace: ns,
+			Labels:    map[string]string{"foo": "bar"},
+		},
+		Spec: atev1alpha1.WorkerPoolSpec{
+			SandboxClass: "gvisor",
+		},
+	})
+	ateInformerFactory := externalversions.NewSharedInformerFactory(fakeAte, 0)
+	workerPoolLister := ateInformerFactory.Api().V1alpha1().WorkerPools().Lister()
+
+	syncer := NewWorkerPoolSyncer(persistence, workerInformer, workerPoolLister)
+	syncer.Start(ctx)
+
+	workerFactory.Start(ctx.Done())
+	workerFactory.WaitForCacheSync(ctx.Done())
+
+	if _, err := fakeK8s.CoreV1().Pods(ns).Create(ctx, &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: ns,
+			UID:       "08675309-4a65-6e6e-7973-6e756d626572",
+			Labels:    map[string]string{workerPodLabel: poolName},
+		},
+		Spec: corev1.PodSpec{
+			NodeName:   "node1",
+			Containers: []corev1.Container{{Name: "main", Image: "nginx"}},
+		},
+		Status: corev1.PodStatus{
+			Phase:  corev1.PodRunning,
+			PodIP:  "127.0.0.1",
+			PodIPs: []corev1.PodIP{{IP: "127.0.0.1"}},
+		},
+	}, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("create pod: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	ateInformerFactory.Start(ctx.Done())
+	ateInformerFactory.WaitForCacheSync(ctx.Done())
+
+	if err := wait.PollUntilContextTimeout(ctx, 50*time.Millisecond, 3*time.Second, true, func(c context.Context) (bool, error) {
+		w, err := persistence.GetWorker(c, ns, poolName, podName)
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if w.SandboxClass != "gvisor" {
+			return false, fmt.Errorf("expected SandboxClass gvisor, got %q", w.SandboxClass)
+		}
+		if !maps.Equal(w.Labels, map[string]string{"foo": "bar"}) {
+			return false, fmt.Errorf("expected labels map[foo:bar], got %v", w.Labels)
+		}
+		return true, nil
+	}); err != nil {
+		t.Fatalf("worker was not materialized after WorkerPool cache caught up: %v", err)
+	}
+}
+
 func TestSyncer_DeleteBoundWorker_ClearsActor(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

@@ -19,8 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"slices"
+	"sort"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
@@ -40,9 +40,10 @@ import (
 
 // ResumeInput holds the immutable parameters requested by the client.
 type ResumeInput struct {
-	ActorName string
-	Atespace  string
-	Boot      bool
+	ActorName     string
+	Atespace      string
+	Boot          bool
+	AvoidNodeName string
 }
 
 // ResumeState holds the mutable state loaded and modified during execution.
@@ -83,26 +84,47 @@ func (s *LoadActorForResumeStep) Execute(ctx context.Context, input *ResumeInput
 func (s *LoadActorForResumeStep) RetryBackoff() *wait.Backoff { return nil }
 
 func isWorkerEligibleForActor(worker *ateapipb.Worker, templateClass atev1alpha1.SandboxClass, templateSelector *metav1.LabelSelector, actorSelector *ateapipb.Selector) (bool, error) {
+	matcher, err := newWorkerEligibilityMatcher(templateClass, templateSelector, actorSelector)
+	if err != nil {
+		return false, err
+	}
+	return matcher.matches(worker), nil
+}
+
+type workerEligibilityMatcher struct {
+	templateClass string
+	templateSel   labels.Selector
+	actorSel      labels.Selector
+}
+
+func newWorkerEligibilityMatcher(templateClass atev1alpha1.SandboxClass, templateSelector *metav1.LabelSelector, actorSelector *ateapipb.Selector) (*workerEligibilityMatcher, error) {
 	// Snapshots are not portable across sandbox classes, so the worker's class
 	// must match the template's. Both classes are populated by the CRD default
 	// (gvisor), so we compare them directly.
-	if worker.GetSandboxClass() != string(templateClass) {
-		return false, nil
-	}
-
 	templateSel := labels.Everything()
 	if templateSelector != nil {
 		sel, err := metav1.LabelSelectorAsSelector(templateSelector)
 		if err != nil {
-			return false, fmt.Errorf("invalid template worker selector: %w", err)
+			return nil, fmt.Errorf("invalid template worker selector: %w", err)
 		}
 		templateSel = sel
 	}
 
 	actorSel := labels.SelectorFromSet(labels.Set(actorSelector.GetMatchLabels()))
 
+	return &workerEligibilityMatcher{
+		templateClass: string(templateClass),
+		templateSel:   templateSel,
+		actorSel:      actorSel,
+	}, nil
+}
+
+func (m *workerEligibilityMatcher) matches(worker *ateapipb.Worker) bool {
+	if worker.GetSandboxClass() != m.templateClass {
+		return false
+	}
 	set := labels.Set(worker.GetLabels())
-	return templateSel.Matches(set) && actorSel.Matches(set), nil
+	return m.templateSel.Matches(set) && m.actorSel.Matches(set)
 }
 
 type AssignWorkerStep struct {
@@ -154,12 +176,26 @@ func (s *AssignWorkerStep) Execute(ctx context.Context, input *ResumeInput, stat
 
 	// If not, find a free one using randomized shuffling
 	if assignedWorker == nil {
-		pickedWorker, err := s.findFreeWorker(workers, state.ActorTemplate.Spec.SandboxClass, state.ActorTemplate.Spec.WorkerSelector, state.Actor.GetWorkerSelector(), state.Actor.GetLatestSnapshotInfo().GetLocal().GetNodeVmsWithLocalSnapshots())
+		hardNodes := state.Actor.GetLatestSnapshotInfo().GetLocal().GetNodeVmsWithLocalSnapshots()
+		preferredNodes := state.Actor.GetLatestSnapshotInfo().GetExternal().GetNodeVmsWithLocalCache()
+		pickedWorker, err := s.findFreeWorkerWithPreferences(workers, state.ActorTemplate.Spec.SandboxClass, state.ActorTemplate.Spec.WorkerSelector, state.Actor.GetWorkerSelector(), hardNodes, preferredNodes, input.AvoidNodeName)
 		if err != nil {
 			return err
 		}
 		if pickedWorker == nil {
-			return status.Errorf(codes.FailedPrecondition, "no free workers available")
+			stats, statsErr := workerSelectionStatsForActor(workers, state.ActorTemplate.Spec.SandboxClass, state.ActorTemplate.Spec.WorkerSelector, state.Actor.GetWorkerSelector(), state.Actor.GetLatestSnapshotInfo().GetLocal().GetNodeVmsWithLocalSnapshots())
+			if statsErr != nil {
+				return statsErr
+			}
+			slog.WarnContext(ctx, "No free workers available",
+				slog.Int("total_workers", stats.Total),
+				slog.Int("assigned_workers", stats.Assigned),
+				slog.Int("eligible_workers", stats.Eligible),
+				slog.Int("eligible_free_workers", stats.EligibleFree),
+				slog.Int("locality_restricted_workers", stats.LocalityRestricted),
+				slog.Int("local_snapshot_nodes", stats.LocalSnapshotNodes))
+			return status.Errorf(codes.FailedPrecondition, "no free workers available (total=%d assigned=%d eligible=%d eligible_free=%d locality_restricted=%d local_snapshot_nodes=%d)",
+				stats.Total, stats.Assigned, stats.Eligible, stats.EligibleFree, stats.LocalityRestricted, stats.LocalSnapshotNodes)
 		}
 
 		assignedWorker = pickedWorker
@@ -215,16 +251,31 @@ func (s *AssignWorkerStep) findFreeWorker(
 	actorSelector *ateapipb.Selector,
 	nodesRestrictions []string,
 ) (*ateapipb.Worker, error) {
+	return s.findFreeWorkerWithPreferences(workers, templateClass, templateSelector, actorSelector, nodesRestrictions, nil, "")
+}
+
+func (s *AssignWorkerStep) findFreeWorkerWithPreferences(
+	workers []*ateapipb.Worker,
+	templateClass atev1alpha1.SandboxClass,
+	templateSelector *metav1.LabelSelector,
+	actorSelector *ateapipb.Selector,
+	nodesRestrictions []string,
+	preferredNodes []string,
+	avoidNodeName string,
+) (*ateapipb.Worker, error) {
+	matcher, err := newWorkerEligibilityMatcher(templateClass, templateSelector, actorSelector)
+	if err != nil {
+		return nil, err
+	}
 	var freeWorkers []*ateapipb.Worker
 	for _, worker := range workers {
 		if worker.Assignment != nil {
 			continue
 		}
-		eligible, err := isWorkerEligibleForActor(worker, templateClass, templateSelector, actorSelector)
-		if err != nil {
-			return nil, err
+		if !matcher.matches(worker) {
+			continue
 		}
-		if !eligible {
+		if avoidNodeName != "" && worker.GetNodeName() == avoidNodeName {
 			continue
 		}
 		if len(nodesRestrictions) == 0 || slices.Contains(nodesRestrictions, worker.GetNodeName()) {
@@ -233,12 +284,64 @@ func (s *AssignWorkerStep) findFreeWorker(
 	}
 
 	if len(freeWorkers) > 0 {
-		rand.Shuffle(len(freeWorkers), func(i, j int) {
-			freeWorkers[i], freeWorkers[j] = freeWorkers[j], freeWorkers[i]
+		sort.Slice(freeWorkers, func(i, j int) bool {
+			iPreferred := slices.Contains(preferredNodes, freeWorkers[i].GetNodeName())
+			jPreferred := slices.Contains(preferredNodes, freeWorkers[j].GetNodeName())
+			if iPreferred != jPreferred {
+				return iPreferred
+			}
+			if freeWorkers[i].GetWorkerPod() != freeWorkers[j].GetWorkerPod() {
+				return freeWorkers[i].GetWorkerPod() < freeWorkers[j].GetWorkerPod()
+			}
+			return freeWorkers[i].GetWorkerNamespace() < freeWorkers[j].GetWorkerNamespace()
 		})
 		return freeWorkers[0], nil
 	}
 	return nil, nil
+}
+
+type workerSelectionStats struct {
+	Total              int
+	Assigned           int
+	Eligible           int
+	EligibleFree       int
+	LocalityRestricted int
+	LocalSnapshotNodes int
+}
+
+func workerSelectionStatsForActor(
+	workers []*ateapipb.Worker,
+	templateClass atev1alpha1.SandboxClass,
+	templateSelector *metav1.LabelSelector,
+	actorSelector *ateapipb.Selector,
+	nodesRestrictions []string,
+) (workerSelectionStats, error) {
+	matcher, err := newWorkerEligibilityMatcher(templateClass, templateSelector, actorSelector)
+	if err != nil {
+		return workerSelectionStats{}, err
+	}
+	stats := workerSelectionStats{
+		Total:              len(workers),
+		LocalSnapshotNodes: len(nodesRestrictions),
+	}
+	for _, worker := range workers {
+		if worker.GetAssignment() != nil {
+			stats.Assigned++
+		}
+		if !matcher.matches(worker) {
+			continue
+		}
+		stats.Eligible++
+		if worker.GetAssignment() != nil {
+			continue
+		}
+		if len(nodesRestrictions) > 0 && !slices.Contains(nodesRestrictions, worker.GetNodeName()) {
+			stats.LocalityRestricted++
+			continue
+		}
+		stats.EligibleFree++
+	}
+	return stats, nil
 }
 
 type CallAteletRestoreStep struct {
@@ -374,3 +477,64 @@ func (s *FinalizeRunningStep) Execute(ctx context.Context, input *ResumeInput, s
 }
 
 func (s *FinalizeRunningStep) RetryBackoff() *wait.Backoff { return nil }
+
+func shouldRollbackFailedResume(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.Canceled, codes.DeadlineExceeded, codes.DataLoss:
+		return true
+	default:
+		return false
+	}
+}
+
+func rollbackFailedResume(ctx context.Context, st store.Interface, atespace, actorName string) error {
+	actor, err := st.GetActor(ctx, atespace, actorName)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("while loading actor for failed resume rollback: %w", err)
+	}
+	if actor.GetStatus() != ateapipb.Actor_STATUS_RESUMING && actor.GetStatus() != ateapipb.Actor_STATUS_CRASHED {
+		return nil
+	}
+
+	if actor.GetAteomPodNamespace() != "" && actor.GetAteomPodName() != "" && actor.GetWorkerPoolName() != "" {
+		worker, err := st.GetWorker(ctx, actor.GetAteomPodNamespace(), actor.GetWorkerPoolName(), actor.GetAteomPodName())
+		if err != nil {
+			if !errors.Is(err, store.ErrNotFound) {
+				return fmt.Errorf("while loading worker for failed resume rollback: %w", err)
+			}
+		} else if assignment := worker.GetAssignment(); assignment != nil &&
+			assignment.GetActor().GetAtespace() == atespace &&
+			assignment.GetActor().GetName() == actorName {
+			worker.Assignment = nil
+			if err := st.UpdateWorker(ctx, worker, worker.GetVersion()); err != nil {
+				return fmt.Errorf("while releasing worker for failed resume rollback: %w", err)
+			}
+		}
+	}
+
+	if actor.GetStatus() == ateapipb.Actor_STATUS_RESUMING {
+		if actor.GetLatestSnapshotInfo().GetData() != nil {
+			actor.Status = ateapipb.Actor_STATUS_SUSPENDED
+		} else {
+			actor.Status = ateapipb.Actor_STATUS_CRASHED
+		}
+	}
+	actor.AteomPodNamespace = ""
+	actor.AteomPodName = ""
+	actor.AteomPodIp = ""
+	actor.AteomPodUid = ""
+	actor.WorkerPoolName = ""
+	if _, err := st.UpdateActor(ctx, actor, actor.GetMetadata().GetVersion()); err != nil {
+		return fmt.Errorf("while updating actor for failed resume rollback: %w", err)
+	}
+	return nil
+}

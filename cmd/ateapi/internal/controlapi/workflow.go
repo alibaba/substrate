@@ -18,6 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
@@ -63,6 +66,7 @@ func RunWorkflow[Params any, Context any](ctx context.Context, params Params, wC
 			return fmt.Errorf("workflow cancelled: %w", err)
 		}
 
+		stepStart := time.Now()
 		ctx, span := tracer.Start(ctx, "step."+step.Name())
 
 		done, err := step.IsComplete(ctx, params, wCtx)
@@ -70,11 +74,13 @@ func RunWorkflow[Params any, Context any](ctx context.Context, params Params, wC
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 			span.End()
+			slog.WarnContext(ctx, "workflow step status check failed", slog.String("step", step.Name()), slog.Duration("duration", time.Since(stepStart)), slog.Any("err", err))
 			return fmt.Errorf("failed checking status of step %s: %w", step.Name(), err)
 		}
 
 		if done {
 			span.End()
+			slog.DebugContext(ctx, "workflow step skipped", slog.String("step", step.Name()), slog.Duration("duration", time.Since(stepStart)))
 			// Fast-forward past this step
 			continue
 		}
@@ -84,9 +90,11 @@ func RunWorkflow[Params any, Context any](ctx context.Context, params Params, wC
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 			span.End()
+			slog.WarnContext(ctx, "workflow step failed", slog.String("step", step.Name()), slog.Duration("duration", time.Since(stepStart)), slog.Any("err", err))
 			return fmt.Errorf("workflow failed at step %s: %w", step.Name(), err)
 		}
 		span.End()
+		slog.InfoContext(ctx, "workflow step completed", slog.String("step", step.Name()), slog.Duration("duration", time.Since(stepStart)))
 	}
 
 	return nil
@@ -148,11 +156,12 @@ func NewActorWorkflow(
 }
 
 // ResumeActor executes the workflow to resume a suspended actor. Idempotent.
-func (w *ActorWorkflow) ResumeActor(ctx context.Context, atespace, name string, boot bool) (*ateapipb.Actor, error) {
+func (w *ActorWorkflow) ResumeActor(ctx context.Context, atespace, name string, boot bool, avoidNodeName string) (*ateapipb.Actor, error) {
 	input := &ResumeInput{
-		ActorName: name,
-		Atespace:  atespace,
-		Boot:      boot,
+		ActorName:     name,
+		Atespace:      atespace,
+		Boot:          boot,
+		AvoidNodeName: avoidNodeName,
 	}
 	state := &ResumeState{}
 
@@ -172,6 +181,13 @@ func (w *ActorWorkflow) ResumeActor(ctx context.Context, atespace, name string, 
 	}
 
 	if err := RunWorkflow(ctx, input, state, steps); err != nil {
+		if shouldRollbackFailedResume(err) {
+			rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if rollbackErr := rollbackFailedResume(rollbackCtx, w.store, atespace, name); rollbackErr != nil {
+				return nil, errors.Join(err, rollbackErr)
+			}
+		}
 		return nil, err
 	}
 
@@ -199,6 +215,34 @@ func (w *ActorWorkflow) SuspendActor(ctx context.Context, atespace, name string)
 		&MarkSuspendingStep{store: w.store},
 		&CallAteletSuspendStep{store: w.store, dialer: w.dialer},
 		&FinalizeSuspendedStep{store: w.store},
+	}
+
+	if err := RunWorkflow(ctx, input, state, steps); err != nil {
+		return nil, err
+	}
+
+	return state.Actor, nil
+}
+
+// BeginSuspendActor marks a running actor as SUSPENDING and returns without
+// calling atelet. It is used by the async durable checkpoint path: a background
+// worker can resume the normal SuspendActor workflow from this persisted state.
+func (w *ActorWorkflow) BeginSuspendActor(ctx context.Context, atespace, name string) (*ateapipb.Actor, error) {
+	input := &SuspendInput{
+		ActorName: name,
+		Atespace:  atespace,
+	}
+	state := &SuspendState{}
+
+	ctx, releaseLock, err := w.acquireActorLock(ctx, atespace, name, 30*time.Second, 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLock()
+
+	steps := []WorkflowStep[*SuspendInput, *SuspendState]{
+		&LoadActorForSuspendStep{store: w.store, actorTemplateLister: w.actorTemplateLister},
+		&MarkSuspendingStep{store: w.store},
 	}
 
 	if err := RunWorkflow(ctx, input, state, steps); err != nil {
@@ -242,8 +286,14 @@ func (w *ActorWorkflow) acquireActorLock(ctx context.Context, atespace, name str
 	lockKey := "lock:actor:" + atespace + ":" + name
 	lockValue := uuid.New().String()
 
-	// Create a child context for the workflow that expires BEFORE the lock
-	workflowTimeout := ttl - padding
+	// Lease renewal decouples operation time from the short lock TTL. The safety
+	// deadline remains finite, while the lock is refreshed only by its owner.
+	workflowTimeout := 5 * time.Minute
+	if raw := os.Getenv("ATE_ACTOR_WORKFLOW_TIMEOUT"); raw != "" {
+		if configured, parseErr := time.ParseDuration(raw); parseErr == nil && configured > padding {
+			workflowTimeout = configured
+		}
+	}
 	workflowCtx, cancel := context.WithTimeout(ctx, workflowTimeout)
 
 	acquired, err := w.store.AcquireLock(workflowCtx, lockKey, lockValue, ttl)
@@ -255,10 +305,39 @@ func (w *ActorWorkflow) acquireActorLock(ctx context.Context, atespace, name str
 		cancel()
 		return nil, nil, status.Error(grpcCodes.Aborted, "another operation is in progress for this actor")
 	}
-
+	stopRenew := make(chan struct{})
+	renewDone := make(chan struct{})
+	go func() {
+		defer close(renewDone)
+		interval := ttl / 3
+		if interval <= 0 {
+			interval = time.Millisecond
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopRenew:
+				return
+			case <-workflowCtx.Done():
+				return
+			case <-ticker.C:
+				renewed, renewErr := w.store.RenewLock(workflowCtx, lockKey, lockValue, ttl)
+				if renewErr != nil || !renewed {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	var releaseOnce sync.Once
 	return workflowCtx, func() {
-		cancel()
-		// Use context.Background() to ensure the lock is released even if the workflow context was canceled.
-		w.store.ReleaseLock(context.Background(), lockKey, lockValue) //nolint:errcheck // best-effort release; the lock TTL is the safety net.
+		releaseOnce.Do(func() {
+			close(stopRenew)
+			cancel()
+			<-renewDone
+			// Use context.Background() to ensure the lock is released even if the workflow context was canceled.
+			w.store.ReleaseLock(context.Background(), lockKey, lockValue) //nolint:errcheck // best-effort release; the lock TTL is the safety net.
+		})
 	}, nil
 }

@@ -42,15 +42,18 @@ type ExtProcServer struct {
 	apiClient     ateapipb.ControlClient
 	recorder      *QueryRecorder
 	resumer       *ActorResumer
+	routeResolver *ActorRouteResolver
 	routeDuration metric.Float64Histogram
 }
 
 func NewExtProcServer(port int, apiClient ateapipb.ControlClient, routeDuration metric.Float64Histogram) *ExtProcServer {
+	resumer := NewActorResumer(apiClient)
 	return &ExtProcServer{
 		port:          port,
 		apiClient:     apiClient,
 		recorder:      NewQueryRecorder(100),
-		resumer:       NewActorResumer(apiClient),
+		resumer:       resumer,
+		routeResolver: NewActorRouteResolver(apiClient, resumer),
 		routeDuration: routeDuration,
 	}
 }
@@ -148,10 +151,10 @@ func (s *ExtProcServer) handleRequestHeaders(
 		return nil, metadata, "", "", "", invalidHostErr(metadata.host, err)
 	}
 
-	slog.InfoContext(ctx, "ResumeActor", slog.String("atespace", atespace), slog.String("actor", actorName))
-	actor, err := s.resumer.ResumeActor(ctx, atespace, actorName)
+	slog.InfoContext(ctx, "ResolveActorRoute", slog.String("atespace", atespace), slog.String("actor", actorName))
+	actor, target, err := s.routeResolver.Resolve(ctx, atespace, actorName)
 	if err != nil {
-		return nil, metadata, "", "", "", mapResumeError(actorName, err)
+		return nil, metadata, "", "", "", mapRouteError(actorName, err)
 	}
 
 	// Actor template identity, used as low-cardinality route-latency metric
@@ -159,20 +162,14 @@ func (s *ExtProcServer) handleRequestHeaders(
 	tmplNs := actor.GetActorTemplateNamespace()
 	tmplName := actor.GetActorTemplateName()
 
-	workerIP := actor.GetAteomPodIp()
-	slog.InfoContext(ctx, "ResumeActor result",
+	slog.InfoContext(ctx, "ResolveActorRoute result",
 		slog.String("atespace", atespace),
 		slog.String("actor", actorName),
 		slog.String("status", actor.GetStatus().String()),
-		slog.String("workerIP", workerIP))
-
-	if ip := net.ParseIP(workerIP); ip == nil {
-		return nil, metadata, "", tmplNs, tmplName, newReqError(envoy_type.StatusCode_InternalServerError,
-			"actor %q routing failed", actorName)
-	}
+		slog.String("target", target.String()))
 
 	// TODO(bowei) -- handle more than port 80 on the actor.
-	targetAddr := net.JoinHostPort(workerIP, "80")
+	targetAddr := target.HostPort()
 
 	slog.InfoContext(ctx, "Route ok", slog.String("actor", actorName), slog.String("targetAddr", targetAddr))
 

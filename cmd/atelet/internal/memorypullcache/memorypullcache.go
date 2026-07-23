@@ -17,10 +17,13 @@ package memorypullcache
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -39,6 +42,8 @@ type MemoryPullCache struct {
 
 	// Map from hexadecimal sha256 hash of image to the cached image (tarball + config env).
 	cache *lru.Cache
+
+	diskCacheDir string
 }
 
 type cachedImage struct {
@@ -61,6 +66,7 @@ func NewMemoryPullCache(ctx context.Context, gcpAuthenticator authn.Authenticato
 		// to just have two levels.  Store some images in ateom memory, and the
 		// rest are kept in a shared GCS cache.
 		cache:                        lru.New(256),
+		diskCacheDir:                 os.Getenv("ATE_IMAGE_PULL_CACHE_DIR"),
 		localhostRegistryReplacement: localhostRegistryReplacement,
 	}
 
@@ -113,6 +119,22 @@ func (c *MemoryPullCache) Fetch(ctx context.Context, ref string) (io.ReadCloser,
 			)
 			img := vAny.(*cachedImage)
 			return io.NopCloser(bytes.NewReader(img.tar)), &img.cfg, nil
+		}
+		if rc, cfg, ok, err := c.readDiskCache(requestedDigest.DigestStr()); err != nil {
+			slog.WarnContext(ctx,
+				"Disk image cache lookup failed",
+				slog.String("ref", ref),
+				slog.String("digest", requestedDigest.DigestStr()),
+				slog.Any("err", err),
+			)
+		} else if ok {
+			slog.InfoContext(
+				ctx,
+				"Disk image cache hit",
+				slog.String("ref", ref),
+				slog.String("digest", requestedDigest.DigestStr()),
+			)
+			return rc, cfg, nil
 		}
 	}
 
@@ -186,6 +208,14 @@ func (c *MemoryPullCache) Fetch(ctx context.Context, ref string) (io.ReadCloser,
 		// from the registry.  We need to place the cache entry under the digest
 		// they requested.
 		c.cache.Add(requestedDigest.DigestStr(), &cachedImage{tar: memData, cfg: imageCfg})
+		if err := c.writeDiskCache(requestedDigest.DigestStr(), memData, imageCfg); err != nil {
+			slog.WarnContext(ctx,
+				"Failed to write disk image cache",
+				slog.String("ref", ref),
+				slog.String("digest", requestedDigest.DigestStr()),
+				slog.Any("err", err),
+			)
+		}
 		slog.InfoContext(
 			ctx,
 			"Populated image cache",
@@ -195,6 +225,80 @@ func (c *MemoryPullCache) Fetch(ctx context.Context, ref string) (io.ReadCloser,
 	}
 
 	return io.NopCloser(bytes.NewReader(memData)), &imageCfg, nil
+}
+
+func (c *MemoryPullCache) readDiskCache(digest string) (io.ReadCloser, *v1.Config, bool, error) {
+	if c.diskCacheDir == "" {
+		return nil, nil, false, nil
+	}
+	tarPath, cfgPath, err := diskCachePaths(c.diskCacheDir, digest)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	cfgBytes, err := os.ReadFile(cfgPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, false, nil
+		}
+		return nil, nil, false, err
+	}
+	var cfg v1.Config
+	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+		return nil, nil, false, fmt.Errorf("while decoding disk image cache config: %w", err)
+	}
+	tarBytes, err := os.ReadFile(tarPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, false, nil
+		}
+		return nil, nil, false, err
+	}
+	c.cache.Add(digest, &cachedImage{tar: tarBytes, cfg: cfg})
+	return io.NopCloser(bytes.NewReader(tarBytes)), &cfg, true, nil
+}
+
+func (c *MemoryPullCache) writeDiskCache(digest string, tarBytes []byte, cfg v1.Config) error {
+	if c.diskCacheDir == "" {
+		return nil
+	}
+	tarPath, cfgPath, err := diskCachePaths(c.diskCacheDir, digest)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(tarPath), 0o700); err != nil {
+		return err
+	}
+	cfgBytes, err := json.Marshal(cfg)
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(cfgPath, cfgBytes, 0o600); err != nil {
+		return fmt.Errorf("while writing image config cache: %w", err)
+	}
+	if err := writeFileAtomic(tarPath, tarBytes, 0o600); err != nil {
+		return fmt.Errorf("while writing image tar cache: %w", err)
+	}
+	return nil
+}
+
+func diskCachePaths(root, digest string) (string, string, error) {
+	if digest == "" || strings.Contains(digest, "/") || strings.Contains(digest, "..") {
+		return "", "", fmt.Errorf("unsafe digest %q", digest)
+	}
+	name := strings.ReplaceAll(digest, ":", "-")
+	return filepath.Join(root, name+".tar"), filepath.Join(root, name+".config.json"), nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 func registryHost(ref string) string {

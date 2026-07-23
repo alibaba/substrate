@@ -91,7 +91,7 @@ func TestSparseZstdRoundTrip(t *testing.T) {
 			defer src.Close()
 
 			var buf bytes.Buffer
-			logical, _, err := writeSparseZstd(&buf, src)
+			logical, _, _, _, err := writeSparseZstd(&buf, src)
 			if err != nil {
 				t.Fatalf("writeSparseZstd: %v", err)
 			}
@@ -108,7 +108,7 @@ func TestSparseZstdRoundTrip(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer dst.Close()
-			size, err := readSparseZstd(dst, bytes.NewReader(buf.Bytes()[len(sparseMagic):]))
+			size, _, err := readSparseZstd(dst, bytes.NewReader(buf.Bytes()[len(sparseMagic):]))
 			if err != nil {
 				t.Fatalf("readSparseZstd: %v", err)
 			}
@@ -128,6 +128,73 @@ func TestSparseZstdRoundTrip(t *testing.T) {
 				t.Fatalf("round-trip mismatch (len got=%d want=%d)", len(got), len(want))
 			}
 		})
+	}
+}
+
+func TestCopySparseExtentSkipsZeroBlocks(t *testing.T) {
+	const block = 64 << 10
+	payload := make([]byte, 3*block)
+	copy(payload[block:block+5], []byte("hello"))
+
+	dir := t.TempDir()
+	dstPath := filepath.Join(dir, "dst")
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	if err := dst.Truncate(int64(len(payload))); err != nil {
+		t.Fatal(err)
+	}
+
+	written, err := copySparseExtent(dst, bytes.NewReader(payload), 0, int64(len(payload)))
+	if err != nil {
+		t.Fatalf("copySparseExtent: %v", err)
+	}
+	if written != 4096 {
+		t.Fatalf("written=%d, want %d", written, 4096)
+	}
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("copySparseExtent output mismatch")
+	}
+}
+
+func TestCopySparseExtentSkipsZeroPagesInsideNonZeroBlocks(t *testing.T) {
+	const block = 64 << 10
+	payload := make([]byte, 4*block)
+	for off := 0; off < len(payload); off += block {
+		payload[off] = byte(off/block + 1)
+	}
+
+	dir := t.TempDir()
+	dstPath := filepath.Join(dir, "dst")
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	if err := dst.Truncate(int64(len(payload))); err != nil {
+		t.Fatal(err)
+	}
+
+	written, err := copySparseExtent(dst, bytes.NewReader(payload), 0, int64(len(payload)))
+	if err != nil {
+		t.Fatalf("copySparseExtent: %v", err)
+	}
+	const wantWritten = 4 * 4096
+	if written != wantWritten {
+		t.Fatalf("written=%d, want %d", written, wantWritten)
+	}
+	got, err := os.ReadFile(dstPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("copySparseExtent output mismatch")
 	}
 }
 
@@ -204,7 +271,7 @@ func TestReadSparseZstdRejectsMalformed(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer dst.Close()
-			_, err = readSparseZstd(dst, bytes.NewReader(tc.stream))
+			_, _, err = readSparseZstd(dst, bytes.NewReader(tc.stream))
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tc.want)
 			}
@@ -226,7 +293,7 @@ func TestReadSparseZstdTruncated(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dst.Close()
-	if _, err := readSparseZstd(dst, bytes.NewReader(stream)); err == nil {
+	if _, _, err := readSparseZstd(dst, bytes.NewReader(stream)); err == nil {
 		t.Fatal("expected an error for a stream missing its end sentinel, got nil")
 	}
 }

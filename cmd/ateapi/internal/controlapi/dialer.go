@@ -17,6 +17,7 @@ package controlapi
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -73,19 +74,28 @@ func (d *AteletDialer) DialForWorker(workerPodNamespace, workerPodName string) (
 	}
 
 	selectedAtelet := matchingAtelets[0].(*corev1.Pod)
-	ateletKey := selectedAtelet.ObjectMeta.Namespace + "/" + selectedAtelet.ObjectMeta.Name
+	if len(selectedAtelet.Status.PodIPs) == 0 {
+		return nil, fmt.Errorf("selected atelet %q has no assigned IPs: %w", selectedAtelet.ObjectMeta.Namespace+"/"+selectedAtelet.ObjectMeta.Name, err)
+	}
+
+	ateletIP := selectedAtelet.Status.PodIPs[0].IP
+	ateletKey := fmt.Sprintf("%s/%s/%s/%s", selectedAtelet.ObjectMeta.Namespace, selectedAtelet.ObjectMeta.Name, selectedAtelet.ObjectMeta.UID, ateletIP)
+	slog.Info("Dialing atelet for worker",
+		"worker", workerPodKey,
+		"worker_node", selectedWorker.Spec.NodeName,
+		"worker_ip", selectedWorker.Status.PodIP,
+		"atelet", selectedAtelet.ObjectMeta.Namespace+"/"+selectedAtelet.ObjectMeta.Name,
+		"atelet_node", selectedAtelet.Spec.NodeName,
+		"atelet_ip", ateletIP,
+	)
 
 	ateletConnAny, ok := d.ateletConns.Get(ateletKey)
 	if ok {
 		return ateletConnAny.(*grpc.ClientConn), nil
 	}
 
-	if len(selectedAtelet.Status.PodIPs) == 0 {
-		return nil, fmt.Errorf("selected atelet %q has no assigned IPs: %w", selectedAtelet.ObjectMeta.Namespace+"/"+selectedAtelet.ObjectMeta.Name, err)
-	}
-
 	ateletConn, err := grpc.NewClient(
-		selectedAtelet.Status.PodIPs[0].IP+":8085",
+		ateletIP+":8085",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithStatsHandler(otelgrpc.NewClientHandler()),
 	)

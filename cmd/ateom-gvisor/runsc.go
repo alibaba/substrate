@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strconv"
+	"time"
 
 	"github.com/agent-substrate/substrate/internal/ateompath"
 )
@@ -63,12 +65,7 @@ func (r *runsc) cmdCreate(ctx context.Context, out io.Writer, containerName stri
 	cmd.Stdout = out
 	cmd.Stderr = out
 
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("while running `runsc create`: %w", err)
-	}
-
-	return nil
+	return runRunscCommand(ctx, "runsc create", containerName, cmd)
 }
 
 func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName string) error {
@@ -95,12 +92,7 @@ func (r *runsc) cmdStart(ctx context.Context, out io.Writer, containerName strin
 	cmd.Stdout = out
 	cmd.Stderr = out
 
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("while running `runsc start`: %w", err)
-	}
-
-	return nil
+	return runRunscCommand(ctx, "runsc start", containerName, cmd)
 }
 
 func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath string) error {
@@ -109,9 +101,7 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 
 	slog.InfoContext(ctx, "About to run runsc checkpoint", slog.String("container", containerName))
 
-	cmd := exec.CommandContext(
-		ctx,
-		r.path,
+	args := []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
@@ -122,15 +112,27 @@ func (r *runsc) cmdCheckpoint(ctx context.Context, containerName, checkpointPath
 		"-root", ateompath.RunSCStateDir(r.atespace, r.actorName),
 		"checkpoint",
 		"-image-path", checkpointPath,
-		containerName, // Name of the container
-	)
+	}
+	if runscCheckpointDirectEnabled() {
+		args = append(args, "-direct")
+	}
+	if runscCheckpointExcludeCommittedZeroPagesEnabled() {
+		args = append(args, "-exclude-committed-zero-pages")
+	}
+	args = append(args, containerName) // Name of the container
+
+	cmd := exec.CommandContext(ctx, r.path, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("while running `runsc checkpoint`: %w", err)
-	}
-	return nil
+	return runRunscCommand(ctx, "runsc checkpoint", containerName, cmd)
+}
+
+func runscCheckpointDirectEnabled() bool {
+	return parseBoolEnv("ATE_RUNSC_CHECKPOINT_DIRECT", false)
+}
+
+func runscCheckpointExcludeCommittedZeroPagesEnabled() bool {
+	return parseBoolEnv("ATE_RUNSC_CHECKPOINT_EXCLUDE_ZERO_PAGES", false)
 }
 
 func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPath string, durableDirMounts []string) error {
@@ -165,11 +167,7 @@ func (r *runsc) cmdFsCheckpoint(ctx context.Context, containerName, checkpointPa
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("while running `runsc fscheckpoint`: %w", err)
-	}
-	return nil
+	return runRunscCommand(ctx, "runsc fscheckpoint", containerName, cmd)
 }
 
 // We take a checkpoint only of the root container of the sandbox, but we need
@@ -180,9 +178,7 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 
 	slog.InfoContext(ctx, "About to run runsc restore", slog.String("container", containerName))
 
-	cmd := exec.CommandContext(
-		ctx,
-		r.path,
+	args := []string{
 		"-log-format", "json",
 		"--alsologtostderr",
 		// "-debug",
@@ -195,17 +191,37 @@ func (r *runsc) cmdRestore(ctx context.Context, out io.Writer, containerName, ch
 		"-bundle", ateompath.OCIBundlePath(r.atespace, r.actorName, containerName),
 		"-image-path", checkpointPath,
 		"-pid-file", ateompath.PIDFilePath(r.atespace, r.actorName, containerName),
-		"-background",
-		"-direct",
-		"-detach",
-		containerName,
-	)
+	}
+	if runscRestoreBackgroundEnabled() {
+		args = append(args, "-background", "-detach")
+	}
+	args = append(args, containerName)
+
+	cmd := exec.CommandContext(ctx, r.path, args...)
 	cmd.Stdout = out
 	cmd.Stderr = out
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("while running `runsc restore`: %w", err)
+	return runRunscCommand(ctx, "runsc restore", containerName, cmd)
+}
+
+func runscRestoreBackgroundEnabled() bool {
+	return parseBoolEnv("ATE_RUNSC_RESTORE_BACKGROUND", true)
+}
+
+func parseBoolEnv(name string, defaultValue bool) bool {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return defaultValue
 	}
-	return nil
+	enabled, err := strconv.ParseBool(raw)
+	if err != nil {
+		slog.Warn("Invalid boolean environment variable, using default",
+			slog.String("name", name),
+			slog.String("value", raw),
+			slog.Bool("default", defaultValue),
+			slog.Any("err", err))
+		return defaultValue
+	}
+	return enabled
 }
 
 func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
@@ -229,12 +245,7 @@ func (r *runsc) cmdDelete(ctx context.Context, containerName string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("while running `runsc delete`: %w", err)
-	}
-
-	return nil
+	return runRunscCommand(ctx, "runsc delete", containerName, cmd)
 }
 
 func (r *runsc) cmdState(ctx context.Context, containerName string) error {
@@ -252,8 +263,28 @@ func (r *runsc) cmdState(ctx context.Context, containerName string) error {
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("while running `runsc state`: %w", err)
+	return runRunscCommand(ctx, "runsc state", containerName, cmd)
+}
+
+func runRunscCommand(ctx context.Context, operation, containerName string, cmd *exec.Cmd) error {
+	start := time.Now()
+	err := cmd.Run()
+	attrs := []any{
+		slog.String("operation", operation),
+		slog.String("container", containerName),
+		slog.Duration("wall", time.Since(start)),
 	}
+	if ps := cmd.ProcessState; ps != nil {
+		attrs = append(attrs,
+			slog.Duration("user_cpu", ps.UserTime()),
+			slog.Duration("system_cpu", ps.SystemTime()),
+			slog.Bool("success", ps.Success()))
+	}
+	if err != nil {
+		attrs = append(attrs, slog.Any("err", err))
+		slog.WarnContext(ctx, "runsc command finished with error", attrs...)
+		return fmt.Errorf("while running `%s`: %w", operation, err)
+	}
+	slog.InfoContext(ctx, "runsc command finished", attrs...)
 	return nil
 }

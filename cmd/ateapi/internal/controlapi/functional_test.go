@@ -163,13 +163,15 @@ type FakeAteletServer struct {
 	RunRequest *ateletpb.RunRequest
 	FailRun    error
 
-	CheckpointCalled  bool
-	CheckpointRequest *ateletpb.CheckpointRequest
+	CheckpointCalled   bool
+	CheckpointRequest  *ateletpb.CheckpointRequest
+	CheckpointRequests []*ateletpb.CheckpointRequest
 
-	RestoreCalled  bool
-	RestoreRequest *ateletpb.RestoreRequest
-	FailRestore    error
-	RestoreDelay   time.Duration
+	RestoreCalled   bool
+	RestoreRequest  *ateletpb.RestoreRequest
+	RestoreRequests []*ateletpb.RestoreRequest
+	FailRestore     error
+	RestoreDelay    time.Duration
 }
 
 func (f *FakeAteletServer) Reset() {
@@ -182,9 +184,11 @@ func (f *FakeAteletServer) Reset() {
 
 	f.CheckpointCalled = false
 	f.CheckpointRequest = nil
+	f.CheckpointRequests = nil
 
 	f.RestoreCalled = false
 	f.RestoreRequest = nil
+	f.RestoreRequests = nil
 	f.FailRestore = nil
 	f.RestoreDelay = 0
 }
@@ -208,6 +212,7 @@ func (f *FakeAteletServer) Checkpoint(ctx context.Context, req *ateletpb.Checkpo
 
 	f.CheckpointCalled = true
 	f.CheckpointRequest = proto.Clone(req).(*ateletpb.CheckpointRequest)
+	f.CheckpointRequests = append(f.CheckpointRequests, proto.Clone(req).(*ateletpb.CheckpointRequest))
 
 	return &ateletpb.CheckpointResponse{}, nil
 }
@@ -218,6 +223,7 @@ func (f *FakeAteletServer) Restore(ctx context.Context, req *ateletpb.RestoreReq
 
 	f.RestoreCalled = true
 	f.RestoreRequest = proto.Clone(req).(*ateletpb.RestoreRequest)
+	f.RestoreRequests = append(f.RestoreRequests, proto.Clone(req).(*ateletpb.RestoreRequest))
 	if f.RestoreDelay > 0 {
 		time.Sleep(f.RestoreDelay)
 	}
@@ -235,6 +241,28 @@ func (f *FakeAteletServer) lastRestoreRequest() *ateletpb.RestoreRequest {
 		return nil
 	}
 	return proto.Clone(f.RestoreRequest).(*ateletpb.RestoreRequest)
+}
+
+func (f *FakeAteletServer) checkpointRequests() []*ateletpb.CheckpointRequest {
+	f.Lock.Lock()
+	defer f.Lock.Unlock()
+
+	out := make([]*ateletpb.CheckpointRequest, 0, len(f.CheckpointRequests))
+	for _, req := range f.CheckpointRequests {
+		out = append(out, proto.Clone(req).(*ateletpb.CheckpointRequest))
+	}
+	return out
+}
+
+func (f *FakeAteletServer) restoreRequests() []*ateletpb.RestoreRequest {
+	f.Lock.Lock()
+	defer f.Lock.Unlock()
+
+	out := make([]*ateletpb.RestoreRequest, 0, len(f.RestoreRequests))
+	for _, req := range f.RestoreRequests {
+		out = append(out, proto.Clone(req).(*ateletpb.RestoreRequest))
+	}
+	return out
 }
 
 type testContext struct {
@@ -642,6 +670,51 @@ func createWorkerPod(t *testing.T, tc *testContext, ns string, name string, node
 	})
 	if err != nil {
 		t.Fatalf("failed to wait for worker to appear in worker cache: %v", err)
+	}
+}
+
+func createAteletPod(t *testing.T, tc *testContext, name string, nodeName string) {
+	t.Helper()
+	if matches, err := tc.service.dialer.ateletIndexer.ByIndex(byNode, nodeName); err == nil && len(matches) > 0 {
+		return
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ateletNamespace,
+			Labels: map[string]string{
+				"app": "atelet",
+			},
+		},
+		Spec: corev1.PodSpec{
+			NodeName: nodeName,
+			Containers: []corev1.Container{
+				{Name: "main", Image: "nginx"},
+			},
+		},
+	}
+	createdPod, err := tc.k8sClient.CoreV1().Pods(ateletNamespace).Create(context.Background(), pod, metav1.CreateOptions{})
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("failed to create atelet pod: %v", err)
+	}
+	if err == nil {
+		createdPod.Status.PodIPs = []corev1.PodIP{{IP: "127.0.0.1"}}
+		createdPod.Status.Phase = corev1.PodRunning
+		_, err = tc.k8sClient.CoreV1().Pods(ateletNamespace).UpdateStatus(context.Background(), createdPod, metav1.UpdateOptions{})
+		if err != nil {
+			t.Fatalf("failed to update atelet pod status: %v", err)
+		}
+	}
+
+	err = wait.PollUntilContextTimeout(context.Background(), 100*time.Millisecond, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+		matches, err := tc.service.dialer.ateletIndexer.ByIndex(byNode, nodeName)
+		if err != nil {
+			return false, nil
+		}
+		return len(matches) == 1, nil
+	})
+	if err != nil {
+		t.Fatalf("failed to wait for atelet pod on node %s: %v", nodeName, err)
 	}
 }
 
@@ -1217,6 +1290,430 @@ func TestResumeActor(t *testing.T) {
 	}
 }
 
+func TestPrepareActorMigrationKeepsSourceAndRestoresTarget(t *testing.T) {
+	ns := namespaceForTest("ns-prepare-migration")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createAteletPod(t, tc, "atelet-node2-"+strings.ToLower(ns[:min(len(ns), 20)]), "node2")
+	createWorkerPod(t, tc, ns, "worker-source", "node1", "pool1")
+	createWorkerPod(t, tc, ns, "worker-target", "node2", "pool1")
+
+	name := "id1"
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+		Metadata:               &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+		ActorTemplateNamespace: ns,
+		ActorTemplateName:      "tmpl1",
+	}})
+	if err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+	}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+	tc.fakeAtelet.Reset()
+
+	resp, err := tc.client.PrepareActorMigration(context.Background(), &ateapipb.PrepareActorMigrationRequest{
+		Actor:            &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		RequireCrossNode: true,
+	})
+	if err != nil {
+		t.Fatalf("PrepareActorMigration failed: %v", err)
+	}
+	actor := resp.GetActor()
+	if got := actor.GetAteomPodName(); got != "worker-source" {
+		t.Fatalf("expected active actor to remain on worker-source, got %q", got)
+	}
+	if got := actor.GetRoute().GetActive().GetAteomPodName(); got != "worker-source" {
+		t.Fatalf("expected route.active worker-source, got %q", got)
+	}
+	if got := actor.GetRoute().GetCandidate().GetAteomPodName(); got != "worker-target" {
+		t.Fatalf("expected route.candidate worker-target, got %q", got)
+	}
+	if got := actor.GetRoute().GetPhase(); got != ateapipb.ActorRoute_PHASE_PREPARING {
+		t.Fatalf("expected route phase PREPARING, got %s", got)
+	}
+	if got := actor.GetMigration().GetPhase(); got != ateapipb.ActorMigration_PHASE_TARGET_READY {
+		t.Fatalf("expected migration phase TARGET_READY, got %s", got)
+	}
+	baseSnapshot := actor.GetMigration().GetBaseSnapshotUriPrefix()
+	if baseSnapshot == "" {
+		t.Fatalf("expected base snapshot to be recorded")
+	}
+	if baseSnapshot == "gs://my-bucket/my-folder" {
+		t.Fatalf("base snapshot should be a fresh source checkpoint, got golden snapshot %q", baseSnapshot)
+	}
+	if !strings.HasPrefix(baseSnapshot, "gs://fake-fake-fake/"+name+"/") {
+		t.Fatalf("base snapshot = %q, want actor snapshot under template location", baseSnapshot)
+	}
+
+	checkpoints := tc.fakeAtelet.checkpointRequests()
+	if len(checkpoints) != 1 {
+		t.Fatalf("expected one preserve-running source Checkpoint during prepare, got %d", len(checkpoints))
+	}
+	checkpointReq := checkpoints[0]
+	if !checkpointReq.GetPreserveRunning() {
+		t.Fatalf("prepare checkpoint PreserveRunning = false, want true")
+	}
+	if got := checkpointReq.GetTargetAteomUid(); got != actor.GetMigration().GetSource().GetAteomPodUid() {
+		t.Fatalf("checkpoint target uid = %q, want source worker uid", got)
+	}
+	if got := checkpointReq.GetExternalConfig().GetSnapshotUriPrefix(); got != baseSnapshot {
+		t.Fatalf("checkpoint snapshot = %q, want base snapshot %q", got, baseSnapshot)
+	}
+
+	restores := tc.fakeAtelet.restoreRequests()
+	if len(restores) != 1 {
+		t.Fatalf("expected one migration target Restore during prepare, got %d", len(restores))
+	}
+	restoreReq := restores[0]
+	if got := restoreReq.GetTargetAteomUid(); got != actor.GetMigration().GetTarget().GetAteomPodUid() {
+		t.Fatalf("restore target uid = %q, want target worker uid", got)
+	}
+	if got := restoreReq.GetExternalConfig().GetSnapshotUriPrefix(); got != baseSnapshot {
+		t.Fatalf("restore snapshot = %q, want base snapshot %q", got, baseSnapshot)
+	}
+
+	listWorkersResp, err := tc.client.ListWorkers(context.Background(), &ateapipb.ListWorkersRequest{})
+	if err != nil {
+		t.Fatalf("ListWorkers failed: %v", err)
+	}
+	assignments := map[string]string{}
+	for _, w := range listWorkersResp.GetWorkers() {
+		if w.GetWorkerNamespace() != ns {
+			continue
+		}
+		if w.GetAssignment().GetActor() != nil {
+			assignments[w.GetWorkerPod()] = w.GetAssignment().GetActor().GetName()
+		}
+	}
+	if assignments["worker-source"] != name {
+		t.Fatalf("source worker assignment = %q, want %q", assignments["worker-source"], name)
+	}
+	if assignments["worker-target"] != name {
+		t.Fatalf("target worker assignment = %q, want %q", assignments["worker-target"], name)
+	}
+}
+
+func TestPrepareActorMigrationReserveOnlySkipsSourceCheckpoint(t *testing.T) {
+	t.Setenv("ATE_MIGRATION_PREPARE_RESERVE_ONLY", "1")
+
+	ns := namespaceForTest("ns-prepare-migration-reserve")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createAteletPod(t, tc, "atelet-node2-reserve-"+strings.ToLower(ns[:min(len(ns), 8)]), "node2")
+	createWorkerPod(t, tc, ns, "worker-source", "node1", "pool1")
+	createWorkerPod(t, tc, ns, "worker-target", "node2", "pool1")
+
+	name := "id1"
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+		Metadata:               &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+		ActorTemplateNamespace: ns,
+		ActorTemplateName:      "tmpl1",
+	}})
+	if err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+	}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+	tc.fakeAtelet.Reset()
+
+	resp, err := tc.client.PrepareActorMigration(context.Background(), &ateapipb.PrepareActorMigrationRequest{
+		Actor:            &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		RequireCrossNode: true,
+	})
+	if err != nil {
+		t.Fatalf("PrepareActorMigration failed: %v", err)
+	}
+	actor := resp.GetActor()
+	if got := actor.GetRoute().GetActive().GetAteomPodName(); got != "worker-source" {
+		t.Fatalf("expected route.active worker-source, got %q", got)
+	}
+	if got := actor.GetRoute().GetCandidate().GetAteomPodName(); got != "worker-target" {
+		t.Fatalf("expected route.candidate worker-target, got %q", got)
+	}
+	if got := actor.GetMigration().GetPhase(); got != ateapipb.ActorMigration_PHASE_TARGET_READY {
+		t.Fatalf("expected migration phase TARGET_READY, got %s", got)
+	}
+	if got := actor.GetMigration().GetBaseSnapshotUriPrefix(); got != "" {
+		t.Fatalf("base snapshot = %q, want empty in reserve-only mode", got)
+	}
+	if checkpoints := tc.fakeAtelet.checkpointRequests(); len(checkpoints) != 0 {
+		t.Fatalf("expected no source Checkpoint during reserve-only prepare, got %d", len(checkpoints))
+	}
+	if restores := tc.fakeAtelet.restoreRequests(); len(restores) != 0 {
+		t.Fatalf("expected no target Restore during reserve-only prepare, got %d", len(restores))
+	}
+}
+
+func TestCommitActorMigrationAfterReserveOnlyPrepare(t *testing.T) {
+	t.Setenv("ATE_MIGRATION_PREPARE_RESERVE_ONLY", "1")
+
+	ns := namespaceForTest("ns-commit-migration-reserve")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createAteletPod(t, tc, "atelet-node2-rescommit-"+strings.ToLower(ns[:min(len(ns), 8)]), "node2")
+	createWorkerPod(t, tc, ns, "worker-source", "node1", "pool1")
+	createWorkerPod(t, tc, ns, "worker-target", "node2", "pool1")
+
+	name := "id1"
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+		Metadata:               &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+		ActorTemplateNamespace: ns,
+		ActorTemplateName:      "tmpl1",
+	}})
+	if err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+	}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+	if _, err := tc.client.PrepareActorMigration(context.Background(), &ateapipb.PrepareActorMigrationRequest{
+		Actor:            &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		RequireCrossNode: true,
+	}); err != nil {
+		t.Fatalf("PrepareActorMigration failed: %v", err)
+	}
+	tc.fakeAtelet.Reset()
+
+	commitResp, err := tc.client.CommitActorMigration(context.Background(), &ateapipb.CommitActorMigrationRequest{
+		Actor:          &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		DrainTimeoutMs: 3000,
+	})
+	if err != nil {
+		t.Fatalf("CommitActorMigration failed: %v", err)
+	}
+	actor := commitResp.GetActor()
+	if got := actor.GetRoute().GetActive().GetAteomPodName(); got != "worker-target" {
+		t.Fatalf("expected route.active worker-target, got %q", got)
+	}
+	if got := actor.GetMigration().GetBaseSnapshotUriPrefix(); got != "" {
+		t.Fatalf("base snapshot = %q, want empty after reserve-only prepare", got)
+	}
+	finalSnapshot := actor.GetMigration().GetFinalSnapshotUriPrefix()
+	if finalSnapshot == "" {
+		t.Fatalf("expected final snapshot to be recorded")
+	}
+	if got := actor.GetLatestSnapshotInfo().GetExternal().GetSnapshotUriPrefix(); got != finalSnapshot {
+		t.Fatalf("latest external snapshot = %q, want final snapshot %q", got, finalSnapshot)
+	}
+	if checkpoints := tc.fakeAtelet.checkpointRequests(); len(checkpoints) != 1 {
+		t.Fatalf("expected one final source Checkpoint during commit, got %d", len(checkpoints))
+	} else if got := checkpoints[0].GetExternalConfig().GetSnapshotUriPrefix(); got != finalSnapshot {
+		t.Fatalf("checkpoint snapshot = %q, want final snapshot %q", got, finalSnapshot)
+	}
+	if restores := tc.fakeAtelet.restoreRequests(); len(restores) != 1 {
+		t.Fatalf("expected one target Restore from final snapshot during commit, got %d", len(restores))
+	} else if got := restores[0].GetExternalConfig().GetSnapshotUriPrefix(); got != finalSnapshot {
+		t.Fatalf("restore snapshot = %q, want final snapshot %q", got, finalSnapshot)
+	}
+}
+
+func TestCommitActorMigrationSwitchesToPreparedTarget(t *testing.T) {
+	ns := namespaceForTest("ns-commit-migration")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createAteletPod(t, tc, "atelet-node2-commit-"+strings.ToLower(ns[:min(len(ns), 12)]), "node2")
+	createWorkerPod(t, tc, ns, "worker-source", "node1", "pool1")
+	createWorkerPod(t, tc, ns, "worker-target", "node2", "pool1")
+
+	name := "id1"
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+		Metadata:               &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+		ActorTemplateNamespace: ns,
+		ActorTemplateName:      "tmpl1",
+	}})
+	if err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+	}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+	prepareResp, err := tc.client.PrepareActorMigration(context.Background(), &ateapipb.PrepareActorMigrationRequest{
+		Actor:            &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		RequireCrossNode: true,
+	})
+	if err != nil {
+		t.Fatalf("PrepareActorMigration failed: %v", err)
+	}
+	baseSnapshot := prepareResp.GetActor().GetMigration().GetBaseSnapshotUriPrefix()
+	if baseSnapshot == "" {
+		t.Fatalf("expected base snapshot to be recorded during prepare")
+	}
+	tc.fakeAtelet.Reset()
+
+	commitResp, err := tc.client.CommitActorMigration(context.Background(), &ateapipb.CommitActorMigrationRequest{
+		Actor:          &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		DrainTimeoutMs: 3000,
+	})
+	if err != nil {
+		t.Fatalf("CommitActorMigration failed: %v", err)
+	}
+	actor := commitResp.GetActor()
+	if got := actor.GetAteomPodName(); got != "worker-target" {
+		t.Fatalf("expected active actor to switch to worker-target, got %q", got)
+	}
+	if got := actor.GetRoute().GetActive().GetAteomPodName(); got != "worker-target" {
+		t.Fatalf("expected route.active worker-target, got %q", got)
+	}
+	if got := actor.GetRoute().GetPhase(); got != ateapipb.ActorRoute_PHASE_ACTIVE {
+		t.Fatalf("expected route phase ACTIVE, got %s", got)
+	}
+	if got := actor.GetMigration().GetPhase(); got != ateapipb.ActorMigration_PHASE_COMMITTED {
+		t.Fatalf("expected migration phase COMMITTED, got %s", got)
+	}
+	if got := actor.GetMigration().GetBaseSnapshotUriPrefix(); got != baseSnapshot {
+		t.Fatalf("base snapshot = %q, want prepare snapshot %q", got, baseSnapshot)
+	}
+	if baseSnapshot == "gs://my-bucket/my-folder" {
+		t.Fatalf("base snapshot should be a fresh source checkpoint, got golden snapshot %q", baseSnapshot)
+	}
+	if !strings.HasPrefix(baseSnapshot, "gs://fake-fake-fake/"+name+"/") {
+		t.Fatalf("base snapshot = %q, want actor snapshot under template location", baseSnapshot)
+	}
+	finalSnapshot := actor.GetMigration().GetFinalSnapshotUriPrefix()
+	if finalSnapshot == "" {
+		t.Fatalf("expected final snapshot to be recorded")
+	}
+	if finalSnapshot == actor.GetMigration().GetBaseSnapshotUriPrefix() {
+		t.Fatalf("final snapshot should be a fresh source checkpoint, got base snapshot %q", finalSnapshot)
+	}
+	if !strings.HasPrefix(finalSnapshot, "gs://fake-fake-fake/"+name+"/") {
+		t.Fatalf("final snapshot = %q, want actor snapshot under template location", finalSnapshot)
+	}
+	if got := actor.GetLatestSnapshotInfo().GetExternal().GetSnapshotUriPrefix(); got != finalSnapshot {
+		t.Fatalf("latest external snapshot = %q, want final snapshot %q", got, finalSnapshot)
+	}
+
+	checkpoints := tc.fakeAtelet.checkpointRequests()
+	if len(checkpoints) != 1 {
+		t.Fatalf("expected one final source Checkpoint during commit, got %d", len(checkpoints))
+	}
+	checkpointReq := checkpoints[0]
+	if got := checkpointReq.GetTargetAteomUid(); got != actor.GetMigration().GetSource().GetAteomPodUid() {
+		t.Fatalf("checkpoint target uid = %q, want source worker uid", got)
+	}
+	if got := checkpointReq.GetExternalConfig().GetSnapshotUriPrefix(); got != finalSnapshot {
+		t.Fatalf("checkpoint snapshot = %q, want final snapshot %q", got, finalSnapshot)
+	}
+
+	restores := tc.fakeAtelet.restoreRequests()
+	if len(restores) != 1 {
+		t.Fatalf("expected one target Restore from final snapshot during commit, got %d", len(restores))
+	}
+	restoreReq := restores[0]
+	if got := restoreReq.GetTargetAteomUid(); got != actor.GetMigration().GetTarget().GetAteomPodUid() {
+		t.Fatalf("restore target uid = %q, want target worker uid", got)
+	}
+	if got := restoreReq.GetExternalConfig().GetSnapshotUriPrefix(); got != finalSnapshot {
+		t.Fatalf("restore snapshot = %q, want final snapshot %q", got, finalSnapshot)
+	}
+
+	listWorkersResp, err := tc.client.ListWorkers(context.Background(), &ateapipb.ListWorkersRequest{})
+	if err != nil {
+		t.Fatalf("ListWorkers failed: %v", err)
+	}
+	assignments := map[string]string{}
+	for _, w := range listWorkersResp.GetWorkers() {
+		if w.GetWorkerNamespace() != ns {
+			continue
+		}
+		if w.GetAssignment().GetActor() != nil {
+			assignments[w.GetWorkerPod()] = w.GetAssignment().GetActor().GetName()
+		}
+	}
+	if assignments["worker-source"] != "" {
+		t.Fatalf("source worker assignment = %q, want released", assignments["worker-source"])
+	}
+	if assignments["worker-target"] != name {
+		t.Fatalf("target worker assignment = %q, want %q", assignments["worker-target"], name)
+	}
+}
+
+func TestCommitActorMigrationCanReusePreparedTarget(t *testing.T) {
+	t.Setenv("ATE_MIGRATION_COMMIT_REUSE_PREPARED_TARGET", "1")
+
+	ns := namespaceForTest("ns-commit-migration-reuse")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createAteletPod(t, tc, "atelet-node2-reuse-"+strings.ToLower(ns[:min(len(ns), 8)]), "node2")
+	createWorkerPod(t, tc, ns, "worker-source", "node1", "pool1")
+	createWorkerPod(t, tc, ns, "worker-target", "node2", "pool1")
+
+	name := "id1"
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{Actor: &ateapipb.Actor{
+		Metadata:               &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: name},
+		ActorTemplateNamespace: ns,
+		ActorTemplateName:      "tmpl1",
+	}})
+	if err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+	}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+	prepareResp, err := tc.client.PrepareActorMigration(context.Background(), &ateapipb.PrepareActorMigrationRequest{
+		Actor:            &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		RequireCrossNode: true,
+	})
+	if err != nil {
+		t.Fatalf("PrepareActorMigration failed: %v", err)
+	}
+	baseSnapshot := prepareResp.GetActor().GetMigration().GetBaseSnapshotUriPrefix()
+	if baseSnapshot == "" {
+		t.Fatalf("expected base snapshot to be recorded during prepare")
+	}
+	tc.fakeAtelet.Reset()
+
+	commitResp, err := tc.client.CommitActorMigration(context.Background(), &ateapipb.CommitActorMigrationRequest{
+		Actor:          &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
+		DrainTimeoutMs: 3000,
+	})
+	if err != nil {
+		t.Fatalf("CommitActorMigration failed: %v", err)
+	}
+	actor := commitResp.GetActor()
+	if got := actor.GetRoute().GetActive().GetAteomPodName(); got != "worker-target" {
+		t.Fatalf("expected route.active worker-target, got %q", got)
+	}
+	if got := actor.GetMigration().GetFinalSnapshotUriPrefix(); got != baseSnapshot {
+		t.Fatalf("final snapshot = %q, want prepared base snapshot %q", got, baseSnapshot)
+	}
+	if got := actor.GetLatestSnapshotInfo().GetExternal().GetSnapshotUriPrefix(); got != baseSnapshot {
+		t.Fatalf("latest external snapshot = %q, want prepared base snapshot %q", got, baseSnapshot)
+	}
+	if checkpoints := tc.fakeAtelet.checkpointRequests(); len(checkpoints) != 0 {
+		t.Fatalf("expected no final source Checkpoint during reuse commit, got %d", len(checkpoints))
+	}
+	if restores := tc.fakeAtelet.restoreRequests(); len(restores) != 0 {
+		t.Fatalf("expected no target Restore during reuse commit, got %d", len(restores))
+	}
+	if got := actor.GetMigration().GetStageDurationMs()["commit_reuse_prepared_target"]; got != 0 {
+		t.Fatalf("commit_reuse_prepared_target duration = %d, want 0", got)
+	}
+}
+
 func TestResumeActorResolvesValueFromEnv(t *testing.T) {
 	ns := namespaceForTest("ns-resume-secret-env")
 	tc := setupTest(t, ns)
@@ -1327,7 +1824,7 @@ func TestResumeActor_NoWorkers(t *testing.T) {
 	_, err = tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{
 		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: name},
 	})
-	assertGrpcError(t, err, codes.FailedPrecondition, "no free workers available")
+	assertGrpcErrorRegex(t, err, codes.FailedPrecondition, `no free workers available \(total=[0-9]+ assigned=[0-9]+ eligible=0 eligible_free=0 locality_restricted=0 local_snapshot_nodes=0\)`)
 }
 
 // TestResumeActor_MultiPoolSelector exercises the AND-of-two-selectors path

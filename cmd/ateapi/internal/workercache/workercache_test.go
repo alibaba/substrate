@@ -58,6 +58,25 @@ func TestCache_SyncsOnStart(t *testing.T) {
 	}
 }
 
+func TestCacheStats(t *testing.T) {
+	free := makeWorker("ns", "pod1", 1)
+	assigned := makeWorker("ns", "pod2", 1)
+	assigned.Assignment = &ateapipb.Assignment{Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: "actor-1"}}
+
+	c := workercache.New(newFakeStore(free, assigned), time.Hour)
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	got, err := c.Stats()
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if got.Total != 2 || got.Free != 1 || got.Assigned != 1 {
+		t.Fatalf("Stats() = %+v, want total=2 free=1 assigned=1", got)
+	}
+}
+
 func TestCache_CreatedEvent(t *testing.T) {
 	fs := newFakeStore()
 	c := workercache.New(fs, time.Hour)

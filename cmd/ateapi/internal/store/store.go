@@ -108,6 +108,9 @@ type Interface interface {
 	// The value must be a unique token (e.g., UUID) to ensure safe release.
 	AcquireLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
 
+	// RenewLock extends the TTL only if value still owns the lock.
+	RenewLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
+
 	// ReleaseLock releases a distributed lock if the stored value matches the passed value.
 	// Returns nil if the lock was successfully released or if the lock was not held by this value.
 	// Returns an error only on database failure.

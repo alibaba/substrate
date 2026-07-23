@@ -21,6 +21,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sys/unix"
@@ -60,35 +61,35 @@ const sparseEndOffset int64 = -1
 // compress from "scan the whole logical image" (e.g. 2GiB) to "scan the resident
 // set" (e.g. ~150MiB). Returns the logical size and the populated (pre-compression)
 // byte count. All integers are little-endian.
-func writeSparseZstd(dst io.Writer, src *os.File) (logical, dataBytes int64, err error) {
+func writeSparseZstd(dst io.Writer, src *os.File) (logical, dataBytes int64, scanDuration, extentCopyDuration time.Duration, err error) {
 	fi, err := src.Stat()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	size := fi.Size()
 
 	// magic + version in the clear (buffered: a couple of tiny writes).
 	bw := bufio.NewWriter(dst)
 	if _, err := bw.WriteString(sparseMagic); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	if err := binary.Write(bw, binary.LittleEndian, sparseVersion); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	if err := bw.Flush(); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 
 	zw, err := zstd.NewWriter(dst,
 		zstd.WithEncoderLevel(zstd.SpeedFastest),
 		zstd.WithEncoderConcurrency(runtime.GOMAXPROCS(0)))
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	// fail closes the encoder before returning err (Close flushes/frees state).
-	fail := func(e error) (int64, int64, error) {
+	fail := func(e error) (int64, int64, time.Duration, time.Duration, error) {
 		zw.Close()
-		return 0, 0, e
+		return 0, 0, scanDuration, extentCopyDuration, e
 	}
 	if err := binary.Write(zw, binary.LittleEndian, size); err != nil {
 		return fail(err)
@@ -97,14 +98,18 @@ func writeSparseZstd(dst io.Writer, src *os.File) (logical, dataBytes int64, err
 	fd := int(src.Fd())
 	off := int64(0)
 	for off < size {
+		scanStart := time.Now()
 		ds, serr := unix.Seek(fd, off, unix.SEEK_DATA)
+		scanDuration += time.Since(scanStart)
 		if serr != nil {
 			if serr == unix.ENXIO { // no more data: the rest is a hole
 				break
 			}
 			return fail(fmt.Errorf("SEEK_DATA: %w", serr))
 		}
+		scanStart = time.Now()
 		de, serr := unix.Seek(fd, ds, unix.SEEK_HOLE)
+		scanDuration += time.Since(scanStart)
 		if serr != nil {
 			return fail(fmt.Errorf("SEEK_HOLE: %w", serr))
 		}
@@ -118,7 +123,9 @@ func writeSparseZstd(dst io.Writer, src *os.File) (logical, dataBytes int64, err
 		if _, err := src.Seek(ds, io.SeekStart); err != nil {
 			return fail(err)
 		}
+		copyStart := time.Now()
 		n, cerr := io.CopyN(zw, src, length)
+		extentCopyDuration += time.Since(copyStart)
 		dataBytes += n
 		if cerr != nil {
 			return fail(fmt.Errorf("reading extent @%d+%d: %w", ds, length, cerr))
@@ -129,39 +136,39 @@ func writeSparseZstd(dst io.Writer, src *os.File) (logical, dataBytes int64, err
 		return fail(err)
 	}
 	if err := zw.Close(); err != nil {
-		return 0, 0, err
+		return 0, 0, scanDuration, extentCopyDuration, err
 	}
-	return size, dataBytes, nil
+	return size, dataBytes, scanDuration, extentCopyDuration, nil
 }
 
 // readSparseZstd decodes the sparse-extent format into dst, which becomes a sparse
 // file (the holes between extents are never written). src must be positioned just
 // AFTER the magic (the caller reads + dispatches on it). dst is truncated to the
 // logical size so trailing holes + the exact size are represented.
-func readSparseZstd(dst *os.File, src io.Reader) (logical int64, err error) {
+func readSparseZstd(dst *os.File, src io.Reader) (logical int64, written int64, err error) {
 	var ver uint32
 	if err := binary.Read(src, binary.LittleEndian, &ver); err != nil {
-		return 0, fmt.Errorf("reading sparse format version: %w", err)
+		return 0, 0, fmt.Errorf("reading sparse format version: %w", err)
 	}
 	if ver != sparseVersion {
-		return 0, fmt.Errorf("unsupported sparse snapshot format version %d (this build supports %d)", ver, sparseVersion)
+		return 0, 0, fmt.Errorf("unsupported sparse snapshot format version %d (this build supports %d)", ver, sparseVersion)
 	}
 
-	zr, err := zstd.NewReader(src, zstd.WithDecoderConcurrency(1))
+	zr, err := zstd.NewReader(src, zstd.WithDecoderConcurrency(snapshotDecoderConcurrency()))
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	defer zr.Close()
 
 	var size int64
 	if err := binary.Read(zr, binary.LittleEndian, &size); err != nil {
-		return 0, fmt.Errorf("reading totalSize: %w", err)
+		return 0, 0, fmt.Errorf("reading totalSize: %w", err)
 	}
 	if size < 0 {
-		return 0, fmt.Errorf("negative totalSize %d", size)
+		return 0, 0, fmt.Errorf("negative totalSize %d", size)
 	}
 	if err := dst.Truncate(size); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	// Replay the extent frames written by writeSparseZstd. Each frame is an offset
@@ -170,27 +177,58 @@ func readSparseZstd(dst *os.File, src io.Reader) (logical int64, err error) {
 	for {
 		var off int64
 		if err := binary.Read(zr, binary.LittleEndian, &off); err != nil {
-			return 0, fmt.Errorf("reading extent offset: %w", err)
+			return 0, 0, fmt.Errorf("reading extent offset: %w", err)
 		}
 		if off == sparseEndOffset {
 			break
 		}
 		var length int64
 		if err := binary.Read(zr, binary.LittleEndian, &length); err != nil {
-			return 0, fmt.Errorf("reading extent length: %w", err)
+			return 0, 0, fmt.Errorf("reading extent length: %w", err)
 		}
 		// Validate against the declared size (the stream is the downloaded snapshot):
 		// an out-of-range extent would seek/write past the file or wrap on the
 		// off+length arithmetic. size-off is safe because off <= size.
 		if off < 0 || length < 0 || off > size || length > size-off {
-			return 0, fmt.Errorf("sparse extent out of range (off=%d len=%d size=%d)", off, length, size)
+			return 0, 0, fmt.Errorf("sparse extent out of range (off=%d len=%d size=%d)", off, length, size)
 		}
-		if _, err := dst.Seek(off, io.SeekStart); err != nil {
-			return 0, err
-		}
-		if _, err := io.CopyN(dst, zr, length); err != nil {
-			return 0, fmt.Errorf("writing extent @%d+%d: %w", off, length, err)
+		n, err := copySparseExtent(dst, zr, off, length)
+		written += n
+		if err != nil {
+			return 0, 0, fmt.Errorf("writing extent @%d+%d: %w", off, length, err)
 		}
 	}
-	return size, nil
+	return size, written, nil
+}
+
+func copySparseExtent(dst *os.File, src io.Reader, off, length int64) (written int64, err error) {
+	const block = 1 << 20
+	buf := make([]byte, block)
+	var pos int64
+	for pos < length {
+		want := int64(len(buf))
+		if remaining := length - pos; remaining < want {
+			want = remaining
+		}
+		n, rerr := io.ReadFull(src, buf[:want])
+		if n > 0 {
+			chunk := buf[:n]
+			nw, werr := writeNonZeroPages(dst, off+pos, chunk)
+			written += nw
+			if werr != nil {
+				return written, werr
+			}
+			pos += int64(n)
+		}
+		if rerr == io.ErrUnexpectedEOF || rerr == io.EOF {
+			if pos == length {
+				break
+			}
+			return written, io.ErrUnexpectedEOF
+		}
+		if rerr != nil {
+			return written, rerr
+		}
+	}
+	return written, nil
 }

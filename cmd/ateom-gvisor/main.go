@@ -22,10 +22,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
+	"time"
 
 	"cloud.google.com/go/compute/metadata"
 	"github.com/agent-substrate/substrate/internal/actorlog"
@@ -49,6 +53,25 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 )
+
+type runtimeStageSummary struct {
+	RunscCheckpoint time.Duration
+	NetworkSetup    time.Duration
+	PauseRestore    time.Duration
+	AppRestore      time.Duration
+	ReadinessWait   time.Duration
+}
+
+func (s runtimeStageSummary) MeasuredTime() time.Duration {
+	return s.RunscCheckpoint + s.NetworkSetup + s.PauseRestore + s.AppRestore + s.ReadinessWait
+}
+
+type snapshotFileDetail struct {
+	Name    string `json:"name"`
+	Size    int64  `json:"size"`
+	Blocks  int64  `json:"blocks"`
+	ModTime string `json:"mod_time"`
+}
 
 var (
 	podUID = pflag.String("pod-uid", "", "The UID of the current pod")
@@ -255,12 +278,26 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	}
 
 	checkpointPath := ateompath.CheckpointStateDir(req.GetAtespace(), req.GetActorName())
+	if directPath, ok, err := directSnapshotImagePath(req.GetSnapshotUriPrefix()); err != nil {
+		return nil, err
+	} else if ok {
+		checkpointPath = directPath
+		slog.InfoContext(ctx, "Using direct SnapshotFS checkpoint image path",
+			slog.String("actor", req.GetActorName()),
+			slog.String("checkpoint_path", checkpointPath),
+			slog.String("snapshot_uri_prefix", req.GetSnapshotUriPrefix()))
+	}
+	if err := os.RemoveAll(checkpointPath); err != nil {
+		return nil, fmt.Errorf("while clearing checkpoint directory: %w", err)
+	}
 	if err := os.MkdirAll(checkpointPath, 0o700); err != nil {
 		return nil, fmt.Errorf("while creating checkpoint directory: %w", err)
 	}
 
 	// Always take durable-dir snapshot if at least one container has a durable-dir volume mount.
 	// TODO(dberkov): this is a temporary workaround until gVisor supports taking durable-dir snapshots in a single request with the process snapshot.
+	var stages runtimeStageSummary
+	tCheckpoint := time.Now()
 	switch req.GetScope() {
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
 		var ddv []string
@@ -281,6 +318,7 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	default:
 		return nil, fmt.Errorf("unsupported snapshot scope: %v", req.GetScope())
 	}
+	stages.RunscCheckpoint = time.Since(tCheckpoint)
 
 	// After checkpointing the sandbox root, runsc may no longer have a usable
 	// control server for state/delete calls. Keep this as best-effort cleanup:
@@ -297,22 +335,27 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 
 	// Report exactly the files runsc wrote so atelet ships precisely this set
 	// (checkpoint.img plus any pages images), rather than a hardcoded list.
-	snapshotFiles, err := listSnapshotFiles(checkpointPath)
+	snapshotFiles, snapshotDetails, err := listSnapshotFiles(checkpointPath)
 	if err != nil {
 		return nil, fmt.Errorf("while listing checkpoint files: %w", err)
 	}
 
 	s.actorLogger.EmitLifecycleLog("Actor checkpointed", req.GetAtespace(), req.GetActorName(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
+	slog.InfoContext(ctx, "Ateom checkpoint timing breakdown",
+		slog.String("actor", req.GetActorName()),
+		slog.Duration("runsc_checkpoint", stages.RunscCheckpoint),
+		slog.Any("snapshot_files", snapshotDetails),
+		slog.Duration("measured_total", stages.MeasuredTime()))
 
 	return &ateompb.CheckpointWorkloadResponse{SnapshotFiles: snapshotFiles}, nil
 }
 
 // listSnapshotFiles returns the (relative) names of regular files directly under
 // dir, which atelet ships to object storage as the snapshot.
-func listSnapshotFiles(dir string) ([]string, error) {
+func listSnapshotFiles(dir string) ([]string, []snapshotFileDetail, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var files []string
 	for _, e := range entries {
@@ -321,7 +364,26 @@ func listSnapshotFiles(dir string) ([]string, error) {
 		}
 	}
 	sort.Strings(files)
-	return files, nil
+
+	details := make([]snapshotFileDetail, 0, len(files))
+	for _, name := range files {
+		path := filepath.Join(dir, name)
+		info, err := os.Stat(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		var st unix.Stat_t
+		if err := unix.Stat(path, &st); err != nil {
+			return nil, nil, err
+		}
+		details = append(details, snapshotFileDetail{
+			Name:    name,
+			Size:    info.Size(),
+			Blocks:  st.Blocks,
+			ModTime: info.ModTime().UTC().Format(time.RFC3339Nano),
+		})
+	}
+	return files, details, nil
 }
 
 func (r *runsc) cleanupContainersAfterCheckpoint(ctx context.Context, containers []*ateompb.Container) error {
@@ -362,9 +424,12 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	//   * All OCI bundles are set up, including for "pause" container.
 	//   * Checkpoint downloaded and placed on disk
 
+	var stages runtimeStageSummary
+	tNetwork := time.Now()
 	if err := s.setupActorNetwork(ctx); err != nil {
 		return nil, fmt.Errorf("while setting up actor network: %w", err)
 	}
+	stages.NetworkSetup = time.Since(tNetwork)
 	defer func() {
 		if retErr != nil {
 			s.cleanupActorNetworkOrExit(ctx, "Failed to clean up actor network after Restore failure")
@@ -378,7 +443,17 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	}
 
 	checkpointDir := ateompath.RestoreStateDir(req.GetAtespace(), req.GetActorName())
+	if directPath, ok, err := directSnapshotImagePath(req.GetSnapshotUriPrefix()); err != nil {
+		return nil, err
+	} else if ok {
+		checkpointDir = directPath
+		slog.InfoContext(ctx, "Using direct SnapshotFS restore image path",
+			slog.String("actor", req.GetActorName()),
+			slog.String("checkpoint_path", checkpointDir),
+			slog.String("snapshot_uri_prefix", req.GetSnapshotUriPrefix()))
+	}
 
+	tPause := time.Now()
 	switch req.GetScope() {
 	case ateompb.SnapshotScope_SNAPSHOT_SCOPE_DATA:
 		// Create and restore pause container
@@ -399,9 +474,11 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	default:
 		return nil, fmt.Errorf("unexpected snapshot scope: %v", req.GetScope())
 	}
+	stages.PauseRestore = time.Since(tPause)
 
 	// Create and restore each application container, each with its own log pipe so
 	// every line is tagged with the originating container (ate.dev/container_name).
+	tApps := time.Now()
 	for _, ac := range req.GetSpec().GetContainers() {
 		pw, err := s.actorLogger.StartJSONLogPipe(req.GetAtespace(), req.GetActorName(), req.GetActorTemplateNamespace(), req.GetActorTemplateName(), ac.GetName())
 		if err != nil {
@@ -427,15 +504,45 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 			return nil, fmt.Errorf("unexpected snapshot scope: %v", req.GetScope())
 		}
 	}
+	stages.AppRestore = time.Since(tApps)
 
 	// Block until every readyz-enabled container reports 200.
+	tReadiness := time.Now()
 	if err := readyz.WaitAll(ctx, req.GetSpec().GetContainers(), actorVethIP); err != nil {
 		return nil, fmt.Errorf("while waiting for container readyz: %w", err)
 	}
+	stages.ReadinessWait = time.Since(tReadiness)
 
 	s.actorLogger.EmitLifecycleLog("Actor restored", req.GetAtespace(), req.GetActorName(), req.GetActorTemplateNamespace(), req.GetActorTemplateName())
+	slog.InfoContext(ctx, "Ateom restore timing breakdown",
+		slog.String("actor", req.GetActorName()),
+		slog.Duration("network_setup", stages.NetworkSetup),
+		slog.Duration("pause_restore", stages.PauseRestore),
+		slog.Duration("app_restore", stages.AppRestore),
+		slog.Duration("readiness_wait", stages.ReadinessWait),
+		slog.Duration("measured_total", stages.MeasuredTime()))
 
 	return &ateompb.RestoreWorkloadResponse{}, nil
+}
+
+func directSnapshotImagePath(snapshotURIPrefix string) (string, bool, error) {
+	root := strings.TrimSpace(os.Getenv("ATE_RUNSC_SNAPSHOT_FS_ROOT"))
+	if root == "" || strings.TrimSpace(snapshotURIPrefix) == "" {
+		return "", false, nil
+	}
+	parsed, err := url.Parse(snapshotURIPrefix)
+	if err != nil {
+		return "", false, fmt.Errorf("while parsing snapshot URI prefix %q: %w", snapshotURIPrefix, err)
+	}
+	if parsed.Host == "" {
+		return "", false, fmt.Errorf("snapshot URI prefix %q missing bucket", snapshotURIPrefix)
+	}
+	object := strings.TrimPrefix(parsed.Path, "/")
+	cleanObject := filepath.Clean(object)
+	if cleanObject == "." || cleanObject == ".." || strings.HasPrefix(cleanObject, "../") || filepath.IsAbs(cleanObject) {
+		return "", false, fmt.Errorf("unsafe snapshot URI object path %q", object)
+	}
+	return filepath.Join(root, parsed.Host, cleanObject), true, nil
 }
 
 func (s *AteomService) setupActorNetwork(ctx context.Context) (retErr error) {

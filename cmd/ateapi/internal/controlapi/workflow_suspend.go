@@ -39,8 +39,9 @@ type SuspendInput struct {
 
 // SuspendState holds the mutable state loaded and modified during execution.
 type SuspendState struct {
-	Actor         *ateapipb.Actor
-	ActorTemplate *atev1alpha1.ActorTemplate
+	Actor               *ateapipb.Actor
+	ActorTemplate       *atev1alpha1.ActorTemplate
+	LocalCachePublished bool
 }
 
 type LoadActorForSuspendStep struct {
@@ -147,7 +148,10 @@ func (s *CallAteletSuspendStep) Execute(ctx context.Context, input *SuspendInput
 		Scope: toAteletSnapshotScope(state.ActorTemplate.Spec.SnapshotsConfig.OnCommit),
 	}
 
-	_, err = client.Checkpoint(ctx, req)
+	resp, err := client.Checkpoint(ctx, req)
+	if err == nil {
+		state.LocalCachePublished = resp.GetLocalCachePublished()
+	}
 	return maybeCrashActor(ctx, s.store, input.Atespace, input.ActorName, err, "while checkpointing workload")
 }
 
@@ -175,6 +179,7 @@ func (s *FinalizeSuspendedStep) Execute(ctx context.Context, input *SuspendInput
 
 		workerPool := latestActor.GetWorkerPoolName()
 
+		nodeName := ""
 		worker, err := s.store.GetWorker(ctx, workerNs, workerPool, workerPod)
 		if err != nil {
 			if !errors.Is(err, store.ErrNotFound) {
@@ -182,6 +187,7 @@ func (s *FinalizeSuspendedStep) Execute(ctx context.Context, input *SuspendInput
 			}
 			slog.Warn("Worker already gone during finalize suspend, skipping release", "worker", workerPod)
 		} else {
+			nodeName = worker.GetNodeName()
 			// Only free it if it still belongs to us
 			if wass := worker.Assignment; wass != nil {
 				if wass.Actor.Atespace == input.Atespace && wass.Actor.Name == input.ActorName {
@@ -194,17 +200,20 @@ func (s *FinalizeSuspendedStep) Execute(ctx context.Context, input *SuspendInput
 			}
 		}
 
-		// 2. Safely clear ActiveWorker now that the worker object in DB is freed
-		latestActor, err = s.store.GetActor(ctx, input.Atespace, input.ActorName)
-		if err != nil {
-			return err
-		}
+		// 2. Safely clear ActiveWorker now that the worker object in DB is freed.
+		// No actor fields are modified while releasing the worker, so the actor
+		// version loaded above is still valid for this update.
 		latestActor.Status = ateapipb.Actor_STATUS_SUSPENDED
 		if latestActor.InProgressSnapshot != "" {
+			var cacheNodes []string
+			if state.LocalCachePublished && nodeName != "" {
+				cacheNodes = []string{nodeName}
+			}
 			latestActor.LatestSnapshotInfo = &ateapipb.SnapshotInfo{
 				Data: &ateapipb.SnapshotInfo_External{
 					External: &ateapipb.ExternalSnapshotInfo{
-						SnapshotUriPrefix: latestActor.InProgressSnapshot,
+						SnapshotUriPrefix:     latestActor.InProgressSnapshot,
+						NodeVmsWithLocalCache: cacheNodes,
 					},
 				},
 			}

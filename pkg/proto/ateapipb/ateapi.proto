@@ -42,6 +42,20 @@ service Control {
   // Resume an actor from its latest snapshot.
   rpc ResumeActor(ResumeActorRequest) returns (ResumeActorResponse) {}
 
+  // Prepare a target worker for request-level hot migration while the source
+  // keeps serving.
+  rpc PrepareActorMigration(PrepareActorMigrationRequest) returns (PrepareActorMigrationResponse) {}
+
+  // Commit a prepared migration by draining the source, finalizing state, and
+  // switching the route.
+  rpc CommitActorMigration(CommitActorMigrationRequest) returns (CommitActorMigrationResponse) {}
+
+  // Abort a prepared migration and keep the actor routed to its source worker.
+  rpc AbortActorMigration(AbortActorMigrationRequest) returns (AbortActorMigrationResponse) {}
+
+  // Return the router-visible route state for an actor.
+  rpc GetActorRoute(GetActorRouteRequest) returns (GetActorRouteResponse) {}
+
   // Delete an actor. Only suspended actors can be deleted.
   rpc DeleteActor(DeleteActorRequest) returns (Actor) {}
 
@@ -69,6 +83,9 @@ service Control {
 
 message ExternalSnapshotInfo {
   string snapshot_uri_prefix = 1;
+  // Node VMs that may have a decoded cache entry for this otherwise portable
+  // external snapshot. This is a scheduling preference, never a restriction.
+  repeated string node_vms_with_local_cache = 2;
 }
 
 message LocalSnapshotInfo {
@@ -157,6 +174,59 @@ message Actor {
   // suspend/pause since eligibility is no longer a single fixed pool
   // reference on the ActorTemplate.
   string worker_pool_name = 12;
+
+  ActorRoute route = 13;
+  ActorMigration migration = 14;
+}
+
+message RouteTarget {
+  string ateom_pod_namespace = 1;
+  string ateom_pod_name = 2;
+  string ateom_pod_ip = 3;
+  string ateom_pod_uid = 4;
+  string worker_pool_name = 5;
+  string node_name = 6;
+}
+
+message ActorRoute {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_ACTIVE = 1;
+    PHASE_PREPARING = 2;
+    PHASE_DRAINING = 3;
+    PHASE_SWITCHED = 4;
+    PHASE_ROLLBACK = 5;
+  }
+
+  RouteTarget active = 1;
+  RouteTarget candidate = 2;
+  Phase phase = 3;
+  int64 generation = 4;
+  google.protobuf.Timestamp drain_deadline = 5;
+}
+
+message ActorMigration {
+  enum Phase {
+    PHASE_UNSPECIFIED = 0;
+    PHASE_PREPARING = 1;
+    PHASE_TARGET_READY = 2;
+    PHASE_DRAINING = 3;
+    PHASE_FINALIZING = 4;
+    PHASE_SWITCHED = 5;
+    PHASE_COMMITTED = 6;
+    PHASE_ABORTED = 7;
+    PHASE_ROLLED_BACK = 8;
+  }
+
+  string migration_id = 1;
+  Phase phase = 2;
+  RouteTarget source = 3;
+  RouteTarget target = 4;
+  string base_snapshot_uri_prefix = 5;
+  string final_snapshot_uri_prefix = 6;
+  map<string, int64> stage_duration_ms = 7;
+  google.protobuf.Timestamp start_time = 8;
+  google.protobuf.Timestamp update_time = 9;
 }
 
 // Atespace is the isolation boundary an Actor is created into. Global-scoped:
@@ -239,10 +309,52 @@ message ResumeActorRequest {
 
   // If true, skip golden snapshot and boot the workload from scratch.
   bool boot = 2;
+
+  // If set, do not place the resumed actor on this Kubernetes node. This is
+  // primarily used to force cross-node restore for portable external snapshots
+  // without creating artificial blocker actors.
+  string avoid_node_name = 3;
 }
 
 message ResumeActorResponse {
   Actor actor = 1;
+}
+
+message PrepareActorMigrationRequest {
+  ObjectRef actor = 1;
+  Selector target_worker_selector = 2;
+  bool require_cross_node = 3;
+}
+
+message PrepareActorMigrationResponse {
+  Actor actor = 1;
+}
+
+message CommitActorMigrationRequest {
+  ObjectRef actor = 1;
+  int32 drain_timeout_ms = 2;
+  bool require_quiesce = 3;
+}
+
+message CommitActorMigrationResponse {
+  Actor actor = 1;
+}
+
+message AbortActorMigrationRequest {
+  ObjectRef actor = 1;
+}
+
+message AbortActorMigrationResponse {
+  Actor actor = 1;
+}
+
+message GetActorRouteRequest {
+  ObjectRef actor = 1;
+}
+
+message GetActorRouteResponse {
+  Actor actor = 1;
+  ActorRoute route = 2;
 }
 
 message DeleteActorRequest {

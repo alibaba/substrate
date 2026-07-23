@@ -19,6 +19,7 @@ import (
 	"errors"
 	"log/slog"
 	"maps"
+	"time"
 
 	"github.com/agent-substrate/substrate/cmd/ateapi/internal/store"
 	"github.com/agent-substrate/substrate/internal/resources"
@@ -27,6 +28,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -121,6 +123,9 @@ func (s *WorkerPoolSyncer) syncWorkerToStore(ctx context.Context, pod *corev1.Po
 	pool, err := s.workerPoolLister.WorkerPools(pod.Namespace).Get(poolName)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to get WorkerPool for worker pod", slog.String("worker", pod.Namespace+"/"+pod.Name), slog.String("pool", poolName), slog.Any("err", err))
+		if apierrors.IsNotFound(err) {
+			s.retrySyncWorkerToStore(ctx, pod)
+		}
 		return
 	}
 
@@ -179,6 +184,20 @@ func (s *WorkerPoolSyncer) syncWorkerToStore(ctx context.Context, pod *corev1.Po
 			slog.ErrorContext(ctx, "Failed to update worker in store", slog.Any("err", err))
 		}
 	}
+}
+
+func (s *WorkerPoolSyncer) retrySyncWorkerToStore(ctx context.Context, pod *corev1.Pod) {
+	pod = pod.DeepCopy()
+	go func() {
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			s.syncWorkerToStore(ctx, pod)
+		}
+	}()
 }
 
 func isWorkerEligible(pod *corev1.Pod) bool {

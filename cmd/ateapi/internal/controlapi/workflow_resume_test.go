@@ -16,6 +16,9 @@ package controlapi
 
 import (
 	"context"
+	"fmt"
+	"slices"
+	"sort"
 	"testing"
 	"time"
 
@@ -25,6 +28,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 func TestIsWorkerEligibleForActor(t *testing.T) {
@@ -215,4 +219,338 @@ func TestAssignWorkerStep_SkipsWorkerAssignedInOtherAtespace(t *testing.T) {
 	if got := stored.GetAssignment().GetActor().GetAtespace(); got != "team-b" {
 		t.Errorf("worker assignment atespace = %q, want %q (assignment: %v)", got, "team-b", stored.GetAssignment())
 	}
+}
+
+func TestRollbackFailedResumeReleasesWorkerAndRestoresSuspendedActor(t *testing.T) {
+	ctx := context.Background()
+	persistence := newTestPersistence(t)
+
+	worker := &ateapipb.Worker{
+		WorkerNamespace: "worker-ns",
+		WorkerPool:      "pool",
+		WorkerPod:       "pod-1",
+		Ip:              "10.0.0.1",
+		WorkerPodUid:    "worker-uid",
+		Assignment: &ateapipb.Assignment{
+			Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: "actor-1"},
+		},
+	}
+	if err := persistence.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker: %v", err)
+	}
+
+	actor := &ateapipb.Actor{
+		Metadata:          &ateapipb.ResourceMetadata{Atespace: "team-a", Name: "actor-1"},
+		Status:            ateapipb.Actor_STATUS_RESUMING,
+		AteomPodNamespace: "worker-ns",
+		AteomPodName:      "pod-1",
+		AteomPodIp:        "10.0.0.1",
+		AteomPodUid:       "worker-uid",
+		WorkerPoolName:    "pool",
+		LatestSnapshotInfo: &ateapipb.SnapshotInfo{
+			Data: &ateapipb.SnapshotInfo_External{
+				External: &ateapipb.ExternalSnapshotInfo{SnapshotUriPrefix: "gs://bucket/snap"},
+			},
+		},
+	}
+	if _, err := persistence.CreateActor(ctx, actor); err != nil {
+		t.Fatalf("CreateActor: %v", err)
+	}
+
+	if err := rollbackFailedResume(ctx, persistence, "team-a", "actor-1"); err != nil {
+		t.Fatalf("rollbackFailedResume: %v", err)
+	}
+
+	storedWorker, err := persistence.GetWorker(ctx, "worker-ns", "pool", "pod-1")
+	if err != nil {
+		t.Fatalf("GetWorker: %v", err)
+	}
+	if storedWorker.GetAssignment() != nil {
+		t.Fatalf("worker assignment = %v, want nil", storedWorker.GetAssignment())
+	}
+
+	storedActor, err := persistence.GetActor(ctx, "team-a", "actor-1")
+	if err != nil {
+		t.Fatalf("GetActor: %v", err)
+	}
+	if storedActor.GetStatus() != ateapipb.Actor_STATUS_SUSPENDED {
+		t.Fatalf("actor status = %v, want SUSPENDED", storedActor.GetStatus())
+	}
+	if storedActor.GetAteomPodName() != "" || storedActor.GetAteomPodNamespace() != "" || storedActor.GetWorkerPoolName() != "" {
+		t.Fatalf("actor still has worker fields: %v", storedActor)
+	}
+	if storedActor.GetLatestSnapshotInfo().GetExternal().GetSnapshotUriPrefix() != "gs://bucket/snap" {
+		t.Fatalf("latest snapshot was not preserved: %v", storedActor.GetLatestSnapshotInfo())
+	}
+}
+
+func TestAssignWorkerStepFindFreeWorkerUsesStableOrder(t *testing.T) {
+	step := &AssignWorkerStep{}
+	workers := []*ateapipb.Worker{
+		{
+			WorkerNamespace: "worker-ns-b",
+			WorkerPod:       "pod-2",
+			SandboxClass:    "gvisor",
+			NodeName:        "node-2",
+		},
+		{
+			WorkerNamespace: "worker-ns-a",
+			WorkerPod:       "pod-1",
+			SandboxClass:    "gvisor",
+			NodeName:        "node-1",
+		},
+		{
+			WorkerNamespace: "worker-ns-c",
+			WorkerPod:       "pod-0",
+			SandboxClass:    "gvisor",
+			NodeName:        "node-3",
+			Assignment: &ateapipb.Assignment{
+				Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: "busy"},
+			},
+		},
+	}
+
+	got, err := step.findFreeWorker(workers, atev1alpha1.SandboxClassGvisor, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("findFreeWorker returned error: %v", err)
+	}
+	if got.GetWorkerPod() != "pod-1" || got.GetWorkerNamespace() != "worker-ns-a" {
+		t.Fatalf("findFreeWorker picked %s/%s, want worker-ns-a/pod-1", got.GetWorkerNamespace(), got.GetWorkerPod())
+	}
+}
+
+func TestAssignWorkerStepFindFreeWorkerRestrictsToLocalSnapshotNodes(t *testing.T) {
+	step := &AssignWorkerStep{}
+	workers := []*ateapipb.Worker{
+		{
+			WorkerNamespace: "worker-ns",
+			WorkerPod:       "pod-1",
+			SandboxClass:    "gvisor",
+			NodeName:        "node-without-snapshot",
+		},
+		{
+			WorkerNamespace: "worker-ns",
+			WorkerPod:       "pod-2",
+			SandboxClass:    "gvisor",
+			NodeName:        "node-with-snapshot",
+		},
+	}
+
+	got, err := step.findFreeWorker(workers, atev1alpha1.SandboxClassGvisor, nil, nil, []string{"node-with-snapshot"})
+	if err != nil {
+		t.Fatalf("findFreeWorker returned error: %v", err)
+	}
+	if got.GetWorkerPod() != "pod-2" {
+		t.Fatalf("findFreeWorker picked %s, want pod-2 on the local snapshot node", got.GetWorkerPod())
+	}
+}
+
+func TestAssignWorkerStepPrefersExternalCacheNodeButFallsBack(t *testing.T) {
+	step := &AssignWorkerStep{}
+	workers := []*ateapipb.Worker{
+		{WorkerNamespace: "worker-ns", WorkerPod: "pod-1", SandboxClass: "gvisor", NodeName: "node-fallback"},
+		{WorkerNamespace: "worker-ns", WorkerPod: "pod-2", SandboxClass: "gvisor", NodeName: "node-cached"},
+	}
+
+	got, err := step.findFreeWorkerWithPreferences(workers, atev1alpha1.SandboxClassGvisor, nil, nil, nil, []string{"node-cached"}, "")
+	if err != nil {
+		t.Fatalf("findFreeWorkerWithPreferences returned error: %v", err)
+	}
+	if got.GetWorkerPod() != "pod-2" {
+		t.Fatalf("preferred selection picked %s, want cached-node pod-2", got.GetWorkerPod())
+	}
+
+	workers[1].Assignment = &ateapipb.Assignment{Actor: &ateapipb.ObjectRef{Atespace: "team", Name: "busy"}}
+	got, err = step.findFreeWorkerWithPreferences(workers, atev1alpha1.SandboxClassGvisor, nil, nil, nil, []string{"node-cached"}, "")
+	if err != nil {
+		t.Fatalf("fallback selection returned error: %v", err)
+	}
+	if got.GetWorkerPod() != "pod-1" {
+		t.Fatalf("fallback selection picked %s, want portable-snapshot pod-1", got.GetWorkerPod())
+	}
+}
+
+func TestAssignWorkerStepFindFreeWorkerAvoidsNode(t *testing.T) {
+	step := &AssignWorkerStep{}
+	workers := []*ateapipb.Worker{
+		{WorkerNamespace: "worker-ns", WorkerPod: "pod-1", SandboxClass: "gvisor", NodeName: "source-node"},
+		{WorkerNamespace: "worker-ns", WorkerPod: "pod-2", SandboxClass: "gvisor", NodeName: "target-node"},
+	}
+
+	got, err := step.findFreeWorkerWithPreferences(workers, atev1alpha1.SandboxClassGvisor, nil, nil, nil, nil, "source-node")
+	if err != nil {
+		t.Fatalf("findFreeWorkerWithPreferences returned error: %v", err)
+	}
+	if got.GetWorkerPod() != "pod-2" {
+		t.Fatalf("selection picked %s on avoided node, want pod-2", got.GetWorkerPod())
+	}
+
+	workers[1].Assignment = &ateapipb.Assignment{Actor: &ateapipb.ObjectRef{Atespace: "team", Name: "busy"}}
+	got, err = step.findFreeWorkerWithPreferences(workers, atev1alpha1.SandboxClassGvisor, nil, nil, nil, nil, "source-node")
+	if err != nil {
+		t.Fatalf("findFreeWorkerWithPreferences returned error with only avoided worker free: %v", err)
+	}
+	if got != nil {
+		t.Fatalf("selection picked %s on avoided node, want no worker", got.GetWorkerPod())
+	}
+}
+
+func TestWorkerSelectionStatsForActor(t *testing.T) {
+	workers := []*ateapipb.Worker{
+		{
+			WorkerNamespace: "worker-ns",
+			WorkerPod:       "assigned",
+			SandboxClass:    "gvisor",
+			NodeName:        "node-with-snapshot",
+			Assignment: &ateapipb.Assignment{
+				Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: "busy"},
+			},
+		},
+		{
+			WorkerNamespace: "worker-ns",
+			WorkerPod:       "restricted",
+			SandboxClass:    "gvisor",
+			NodeName:        "node-without-snapshot",
+		},
+		{
+			WorkerNamespace: "worker-ns",
+			WorkerPod:       "free",
+			SandboxClass:    "gvisor",
+			NodeName:        "node-with-snapshot",
+		},
+		{
+			WorkerNamespace: "worker-ns",
+			WorkerPod:       "wrong-class",
+			SandboxClass:    "microvm",
+			NodeName:        "node-with-snapshot",
+		},
+	}
+
+	got, err := workerSelectionStatsForActor(workers, atev1alpha1.SandboxClassGvisor, nil, nil, []string{"node-with-snapshot"})
+	if err != nil {
+		t.Fatalf("workerSelectionStatsForActor returned error: %v", err)
+	}
+	want := workerSelectionStats{
+		Total:              4,
+		Assigned:           1,
+		Eligible:           3,
+		EligibleFree:       1,
+		LocalityRestricted: 1,
+		LocalSnapshotNodes: 1,
+	}
+	if got != want {
+		t.Fatalf("workerSelectionStatsForActor = %+v, want %+v", got, want)
+	}
+}
+
+func BenchmarkFindFreeWorkerLegacySelectorCompilation(b *testing.B) {
+	step := &AssignWorkerStep{}
+	workers := benchmarkWorkers(2000)
+	templateSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"workload": "code-sandbox"}}
+	actorSelector := &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}}
+	nodes := []string{"node-7", "node-9", "node-11"}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		worker, err := legacyFindFreeWorkerForBenchmark(workers, atev1alpha1.SandboxClassGvisor, templateSelector, actorSelector, nodes)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if worker == nil {
+			b.Fatal("expected worker")
+		}
+	}
+	_ = step
+}
+
+func BenchmarkFindFreeWorkerPrecompiledSelector(b *testing.B) {
+	step := &AssignWorkerStep{}
+	workers := benchmarkWorkers(2000)
+	templateSelector := &metav1.LabelSelector{MatchLabels: map[string]string{"workload": "code-sandbox"}}
+	actorSelector := &ateapipb.Selector{MatchLabels: map[string]string{"tier": "paid"}}
+	nodes := []string{"node-7", "node-9", "node-11"}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		worker, err := step.findFreeWorker(workers, atev1alpha1.SandboxClassGvisor, templateSelector, actorSelector, nodes)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if worker == nil {
+			b.Fatal("expected worker")
+		}
+	}
+}
+
+func benchmarkWorkers(n int) []*ateapipb.Worker {
+	workers := make([]*ateapipb.Worker, 0, n)
+	for i := 0; i < n; i++ {
+		worker := &ateapipb.Worker{
+			WorkerNamespace: "worker-ns",
+			WorkerPod:       fmt.Sprintf("worker-%04d", i),
+			SandboxClass:    "gvisor",
+			NodeName:        fmt.Sprintf("node-%d", i%32),
+			Labels: map[string]string{
+				"workload": "code-sandbox",
+				"tier":     "paid",
+			},
+		}
+		if i%3 == 0 {
+			worker.Assignment = &ateapipb.Assignment{Actor: &ateapipb.ObjectRef{Atespace: "team-a", Name: fmt.Sprintf("busy-%d", i)}}
+		}
+		workers = append(workers, worker)
+	}
+	return workers
+}
+
+func legacyFindFreeWorkerForBenchmark(
+	workers []*ateapipb.Worker,
+	templateClass atev1alpha1.SandboxClass,
+	templateSelector *metav1.LabelSelector,
+	actorSelector *ateapipb.Selector,
+	nodesRestrictions []string,
+) (*ateapipb.Worker, error) {
+	var freeWorkers []*ateapipb.Worker
+	for _, worker := range workers {
+		if worker.Assignment != nil {
+			continue
+		}
+		eligible, err := legacyIsWorkerEligibleForActorForBenchmark(worker, templateClass, templateSelector, actorSelector)
+		if err != nil {
+			return nil, err
+		}
+		if !eligible {
+			continue
+		}
+		if len(nodesRestrictions) == 0 || slices.Contains(nodesRestrictions, worker.GetNodeName()) {
+			freeWorkers = append(freeWorkers, worker)
+		}
+	}
+	if len(freeWorkers) == 0 {
+		return nil, nil
+	}
+	sort.Slice(freeWorkers, func(i, j int) bool {
+		if freeWorkers[i].GetWorkerPod() != freeWorkers[j].GetWorkerPod() {
+			return freeWorkers[i].GetWorkerPod() < freeWorkers[j].GetWorkerPod()
+		}
+		return freeWorkers[i].GetWorkerNamespace() < freeWorkers[j].GetWorkerNamespace()
+	})
+	return freeWorkers[0], nil
+}
+
+func legacyIsWorkerEligibleForActorForBenchmark(worker *ateapipb.Worker, templateClass atev1alpha1.SandboxClass, templateSelector *metav1.LabelSelector, actorSelector *ateapipb.Selector) (bool, error) {
+	if worker.GetSandboxClass() != string(templateClass) {
+		return false, nil
+	}
+	templateSel := labels.Everything()
+	if templateSelector != nil {
+		sel, err := metav1.LabelSelectorAsSelector(templateSelector)
+		if err != nil {
+			return false, fmt.Errorf("invalid template worker selector: %w", err)
+		}
+		templateSel = sel
+	}
+	actorSel := labels.SelectorFromSet(labels.Set(actorSelector.GetMatchLabels()))
+	set := labels.Set(worker.GetLabels())
+	return templateSel.Matches(set) && actorSel.Matches(set), nil
 }

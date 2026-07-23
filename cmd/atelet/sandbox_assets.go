@@ -41,6 +41,11 @@ import (
 // so a Restore — possibly on another node — is self-describing.
 const sandboxManifestName = "manifest.json"
 
+const (
+	snapshotFormatSparseZstdV1 = "sparse-zstd-v1"
+	snapshotFormatRawSparseV1  = "raw-sparse-v1"
+)
+
 // maxAssetBytes guards disk against an unbounded download URL; a var so tests can lower it.
 // ponytail: 8GiB ceiling, make it a flag if a rootfs ever needs more.
 var maxAssetBytes int64 = 8 << 30
@@ -64,7 +69,25 @@ type sandboxAssetsRecord struct {
 	// in the snapshot manifest so Restore ships/downloads exactly this set
 	// (gVisor's image files, cloud-hypervisor's snapshot set, ...). Empty in the
 	// on-node record written at Run/Restore; populated at Checkpoint.
-	SnapshotFiles []string `json:"snapshotFiles,omitempty"`
+	SnapshotFiles      []string                               `json:"snapshotFiles,omitempty"`
+	SnapshotFileChunks map[string][]ategcs.SnapshotFSRawChunk `json:"snapshotFileChunks,omitempty"`
+	SnapshotFormat     string                                 `json:"snapshotFormat,omitempty"`
+}
+
+func (r *sandboxAssetsRecord) snapshotFormat() string {
+	if r.SnapshotFormat == "" {
+		return snapshotFormatSparseZstdV1
+	}
+	return r.SnapshotFormat
+}
+
+func configuredSnapshotFormat() string {
+	switch os.Getenv("ATE_SNAPSHOT_FORMAT") {
+	case snapshotFormatRawSparseV1:
+		return snapshotFormatRawSparseV1
+	default:
+		return snapshotFormatSparseZstdV1
+	}
 }
 
 // recordFromRequest projects a request's per-architecture SandboxAssets onto the
