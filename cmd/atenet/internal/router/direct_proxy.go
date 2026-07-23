@@ -23,6 +23,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 )
 
 const (
@@ -92,6 +94,11 @@ func (s *RouterServer) handleDirectProxy(w http.ResponseWriter, req *http.Reques
 		return
 	}
 
+	cacheKey := directProxyCacheKey(atespace, actorName, req)
+	if shouldServeCachedDirectProxyResponseBeforeUpstream(routeTarget.Phase) && s.writeCachedDirectProxyResponse(w, cacheKey) {
+		return
+	}
+
 	if err := s.serveDirectProxyTarget(w, req, atespace, actorName, routeTarget); err == nil {
 		return
 	} else if !isDirectProxyRetryable(req) {
@@ -102,7 +109,7 @@ func (s *RouterServer) handleDirectProxy(w http.ResponseWriter, req *http.Reques
 			slog.Any("err", err))
 		http.Error(w, "upstream actor request failed", http.StatusBadGateway)
 		return
-	} else if s.writeCachedDirectProxyResponse(w, directProxyCacheKey(atespace, actorName, req)) {
+	} else if s.writeCachedDirectProxyResponse(w, cacheKey) {
 		return
 	}
 
@@ -122,7 +129,7 @@ func (s *RouterServer) handleDirectProxy(w http.ResponseWriter, req *http.Reques
 		}
 		if err := s.serveDirectProxyTarget(w, req, atespace, actorName, routeTarget); err != nil {
 			lastErr = err
-			if s.writeCachedDirectProxyResponse(w, directProxyCacheKey(atespace, actorName, req)) {
+			if s.writeCachedDirectProxyResponse(w, cacheKey) {
 				return
 			}
 			continue
@@ -235,6 +242,15 @@ func (s *RouterServer) writeCachedDirectProxyResponse(w http.ResponseWriter, key
 		_, _ = w.Write(cached.body)
 	}
 	return true
+}
+
+func shouldServeCachedDirectProxyResponseBeforeUpstream(phase ateapipb.ActorRoute_Phase) bool {
+	switch phase {
+	case ateapipb.ActorRoute_PHASE_DRAINING, ateapipb.ActorRoute_PHASE_SWITCHED:
+		return true
+	default:
+		return false
+	}
 }
 
 func isDirectProxyRetryable(req *http.Request) bool {

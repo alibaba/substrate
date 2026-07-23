@@ -142,7 +142,16 @@ func LoadConfig(kubeconfigPath, k8sContext string) (*rest.Config, error) {
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	loadingRules.ExplicitPath = kubeconfigPath
 	configOverrides := &clientcmd.ConfigOverrides{CurrentContext: k8sContext}
-	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides).ClientConfig()
+	config, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides).ClientConfig()
+	if err == nil {
+		return config, nil
+	}
+	if kubeconfigPath == "" {
+		if inClusterConfig, inClusterErr := rest.InClusterConfig(); inClusterErr == nil {
+			return inClusterConfig, nil
+		}
+	}
+	return nil, err
 }
 
 func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext string, traceEnabled bool) (*Client, error) {

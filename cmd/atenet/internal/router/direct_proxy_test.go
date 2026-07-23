@@ -186,6 +186,68 @@ func TestDirectProxyServesStaleCachedGETAfterUpstreamFailure(t *testing.T) {
 	}
 }
 
+func TestDirectProxyServesStaleCachedGETBeforeUpstreamDuringDrain(t *testing.T) {
+	var routeCalls atomic.Int32
+	var upstreamCalls atomic.Int32
+	client := &routeResolverMockClient{
+		getRouteFn: func(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error) {
+			phase := ateapipb.ActorRoute_PHASE_ACTIVE
+			if routeCalls.Add(1) > 1 {
+				phase = ateapipb.ActorRoute_PHASE_DRAINING
+			}
+			return &ateapipb.GetActorRouteResponse{
+				Actor: &ateapipb.Actor{
+					Status: ateapipb.Actor_STATUS_RUNNING,
+					Route: &ateapipb.ActorRoute{
+						Active:     &ateapipb.RouteTarget{AteomPodIp: "10.0.0.1"},
+						Phase:      phase,
+						Generation: 1,
+					},
+				},
+			}, nil
+		},
+	}
+	resolver := NewActorRouteResolver(client, NewActorResumer(client))
+	srv := &RouterServer{
+		extprocSrv: &ExtProcServer{routeResolver: resolver},
+		inflight:   newInFlightTracker(),
+		directProxyTransport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if upstreamCalls.Add(1) > 1 {
+				t.Fatal("upstream should not be called while serving cached GET during drain")
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("cached")),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "http://my-actor.team-a.actors.resources.substrate.ate.dev/substrate/migration-state", nil)
+	req.Host = "my-actor.team-a.actors.resources.substrate.ate.dev"
+	first := httptest.NewRecorder()
+	srv.handleDirectProxy(first, req)
+	if first.Code != http.StatusOK || first.Body.String() != "cached" {
+		t.Fatalf("first response = %d %q, want 200 cached", first.Code, first.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "http://my-actor.team-a.actors.resources.substrate.ate.dev/substrate/migration-state", nil)
+	req.Host = "my-actor.team-a.actors.resources.substrate.ate.dev"
+	second := httptest.NewRecorder()
+	srv.handleDirectProxy(second, req)
+
+	if second.Code != http.StatusOK || second.Body.String() != "cached" {
+		t.Fatalf("second response = %d %q, want stale cached", second.Code, second.Body.String())
+	}
+	if second.Header().Get("X-Substrate-Stale") != "true" {
+		t.Fatalf("X-Substrate-Stale = %q, want true", second.Header().Get("X-Substrate-Stale"))
+	}
+	if got := upstreamCalls.Load(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
+	}
+}
+
 func TestDirectProxyServesStaleCachedGETWhenUpstreamStalls(t *testing.T) {
 	client := &routeResolverMockClient{
 		getRouteFn: func(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error) {

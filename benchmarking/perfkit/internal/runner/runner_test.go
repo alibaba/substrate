@@ -181,6 +181,14 @@ func TestRouterHTTPServiceNameCanBeOverridden(t *testing.T) {
 	}
 }
 
+func TestRouterHTTPBaseURLCanBeOverridden(t *testing.T) {
+	t.Setenv("PERFKIT_ROUTER_BASE_URL", "http://atenet-router-direct.ate-system.svc.cluster.local")
+
+	if got := routerHTTPBaseURLOverride(); got != "http://atenet-router-direct.ate-system.svc.cluster.local" {
+		t.Fatalf("routerHTTPBaseURLOverride() = %q", got)
+	}
+}
+
 func TestDrainBlockerLifecycleConfigDefaultsToMeasuredTemplate(t *testing.T) {
 	cfg := CrossNodeRecoverConfig{
 		LifecycleConfig: LifecycleConfig{

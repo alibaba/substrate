@@ -186,8 +186,8 @@ func RunCrossNodeRecover(ctx context.Context, cfg CrossNodeRecoverConfig, out io
 
 func RunHotMigration(ctx context.Context, cfg HotMigrationConfig, out io.Writer) error {
 	base := cfg.LifecycleConfig
-	if base.Kubeconfig == "" || base.RunID == "" || base.Atespace == "" {
-		return fmt.Errorf("kubeconfig, run id, and atespace are required")
+	if base.RunID == "" || base.Atespace == "" {
+		return fmt.Errorf("run id and atespace are required")
 	}
 	if base.Count < 1 {
 		return fmt.Errorf("count must be >= 1")
@@ -1275,6 +1275,13 @@ type routerHTTPProber struct {
 }
 
 func newRouterHTTPProber(ctx context.Context, kubeconfig string) (*routerHTTPProber, error) {
+	if baseURL := routerHTTPBaseURLOverride(); baseURL != "" {
+		return &routerHTTPProber{
+			baseURL: strings.TrimRight(baseURL, "/"),
+			client:  &http.Client{Timeout: 30 * time.Second},
+		}, nil
+	}
+
 	config, err := ateclient.LoadConfig(kubeconfig, "")
 	if err != nil {
 		return nil, fmt.Errorf("load kubeconfig: %w", err)
@@ -1360,8 +1367,14 @@ func routerHTTPServiceName() string {
 	return "atenet-router"
 }
 
+func routerHTTPBaseURLOverride() string {
+	return os.Getenv("PERFKIT_ROUTER_BASE_URL")
+}
+
 func (p *routerHTTPProber) Close() {
-	close(p.stopCh)
+	if p.stopCh != nil {
+		close(p.stopCh)
+	}
 }
 
 func (p *routerHTTPProber) Probe(ctx context.Context, atespace, actor, path string) (httpProbeResult, error) {
