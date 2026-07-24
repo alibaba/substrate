@@ -243,6 +243,25 @@ func TestDirectCheckpointAllowsMicroVMWhenFilesAlreadyOnSnapshotFS(t *testing.T)
 	}
 }
 
+func TestDirectCheckpointFallsBackWhenSnapshotFSMissingFiles(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("ATE_SNAPSHOT_FS_ROOT", root)
+	t.Setenv("ATE_SNAPSHOT_DIRECT_CHECKPOINT", "1")
+
+	req := validCheckpointRequest()
+	req.GetExternalConfig().SnapshotUriPrefix = "gs://bucket/snapshot-1"
+	rec := &sandboxAssetsRecord{
+		SandboxClass:   "microvm",
+		SnapshotFormat: snapshotFormatRawSparseV1,
+		SnapshotFiles:  []string{"base-id", "config.json", "memory-ranges", "state.json"},
+	}
+
+	got, ok, err := directCheckpointPath(req, rec)
+	if err != nil || ok || got != "" {
+		t.Fatalf("directCheckpointPath=(%q,%v,%v), want (\"\",false,nil)", got, ok, err)
+	}
+}
+
 func TestCheckpointAlreadyOnSnapshotFS(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("ATE_SNAPSHOT_FS_ROOT", root)

@@ -655,6 +655,9 @@ func directCheckpointPath(req *ateletpb.CheckpointRequest, rec *sandboxAssetsRec
 		}
 		info, err := os.Stat(filepath.Join(dir, name))
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "", false, nil
+			}
 			return "", false, fmt.Errorf("while validating direct-checkpoint file %q: %w", name, err)
 		}
 		if !info.Mode().IsRegular() {
