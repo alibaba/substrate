@@ -3176,6 +3176,48 @@ func TestDeleteActor_Success(t *testing.T) {
 	assertGrpcError(t, err, codes.NotFound, "Actor id1 not found")
 }
 
+func TestDeleteActor_ReleasesWorkerAssignment(t *testing.T) {
+	ns := namespaceForTest("ns-delete-release-worker")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	actor := &ateapipb.Actor{
+		Metadata:               &ateapipb.ResourceMetadata{Atespace: testAtespace, Name: "id1"},
+		ActorTemplateNamespace: ns,
+		ActorTemplateName:      "tmpl1",
+		Status:                 ateapipb.Actor_STATUS_CRASHED,
+	}
+	if _, err := tc.persistence.CreateActor(context.Background(), actor); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	worker := &ateapipb.Worker{
+		WorkerNamespace: ns,
+		WorkerPool:      "pool1",
+		WorkerPod:       "worker-1",
+		Assignment: &ateapipb.Assignment{
+			ActorTemplate: &ateapipb.KubeNamespacedObjectRef{Namespace: ns, Name: "tmpl1"},
+			Actor:         &ateapipb.ObjectRef{Atespace: testAtespace, Name: "id1"},
+		},
+	}
+	if err := tc.persistence.CreateWorker(context.Background(), worker); err != nil {
+		t.Fatalf("CreateWorker failed: %v", err)
+	}
+
+	if _, err := tc.client.DeleteActor(context.Background(), &ateapipb.DeleteActorRequest{
+		Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "id1"},
+	}); err != nil {
+		t.Fatalf("DeleteActor failed: %v", err)
+	}
+
+	got, err := tc.persistence.GetWorker(context.Background(), ns, "pool1", "worker-1")
+	if err != nil {
+		t.Fatalf("GetWorker failed: %v", err)
+	}
+	if got.GetAssignment() != nil {
+		t.Fatalf("worker assignment after DeleteActor = %+v, want nil", got.GetAssignment())
+	}
+}
+
 func TestDeleteActor_NotSuspended(t *testing.T) {
 	ns := namespaceForTest("ns-delete-notsuspended")
 	tc := setupTest(t, ns)

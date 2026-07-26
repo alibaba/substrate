@@ -530,10 +530,40 @@ func (s *Persistence) DeleteActor(ctx context.Context, atespace, name string) (*
 		if errors.Is(err, redis.TxFailedErr) {
 			return nil, store.ErrPersistenceRetry
 		}
+		if errors.Is(err, store.ErrNotFound) {
+			if releaseErr := s.releaseActorAssignments(ctx, atespace, name); releaseErr != nil {
+				return nil, releaseErr
+			}
+		}
 		return nil, err
 	}
 
+	if err := s.releaseActorAssignments(ctx, atespace, name); err != nil {
+		return deleted, err
+	}
 	return deleted, nil
+}
+
+func (s *Persistence) releaseActorAssignments(ctx context.Context, atespace, name string) error {
+	workers, err := s.ListWorkers(ctx)
+	if err != nil {
+		return fmt.Errorf("while listing workers for deleted actor assignment release: %w", err)
+	}
+	for _, worker := range workers {
+		if !workerAssignmentMatchesActor(worker, atespace, name) {
+			continue
+		}
+		worker.Assignment = nil
+		if err := s.UpdateWorker(ctx, worker, worker.GetVersion()); err != nil {
+			return fmt.Errorf("while releasing worker %s/%s assignment for deleted actor %s/%s: %w", worker.GetWorkerNamespace(), worker.GetWorkerPod(), atespace, name, err)
+		}
+	}
+	return nil
+}
+
+func workerAssignmentMatchesActor(worker *ateapipb.Worker, atespace, name string) bool {
+	actor := worker.GetAssignment().GetActor()
+	return actor.GetAtespace() == atespace && actor.GetName() == name
 }
 
 func (s *Persistence) UpdateActor(ctx context.Context, actor *ateapipb.Actor, expectedVersion int64) (*ateapipb.Actor, error) {

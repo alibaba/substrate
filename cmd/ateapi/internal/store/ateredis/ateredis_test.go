@@ -436,6 +436,82 @@ func TestDeleteActor(t *testing.T) {
 	}
 }
 
+func TestDeleteActor_ReleasesWorkerAssignment(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	actor := &ateapipb.Actor{
+		Metadata:               &ateapipb.ResourceMetadata{Name: "session-1", Atespace: testAtespace},
+		ActorTemplateNamespace: "default",
+		ActorTemplateName:      "test-template",
+		Status:                 ateapipb.Actor_STATUS_CRASHED,
+	}
+	if _, err := s.CreateActor(ctx, actor); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+
+	worker := &ateapipb.Worker{
+		WorkerNamespace: "default",
+		WorkerPool:      "pool-1",
+		WorkerPod:       "pod-1",
+		Assignment: &ateapipb.Assignment{
+			ActorTemplate: &ateapipb.KubeNamespacedObjectRef{
+				Namespace: "default",
+				Name:      "test-template",
+			},
+			Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "session-1"},
+		},
+	}
+	if err := s.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker failed: %v", err)
+	}
+
+	if _, err := s.DeleteActor(ctx, testAtespace, "session-1"); err != nil {
+		t.Fatalf("DeleteActor failed: %v", err)
+	}
+
+	got, err := s.GetWorker(ctx, "default", "pool-1", "pod-1")
+	if err != nil {
+		t.Fatalf("GetWorker failed: %v", err)
+	}
+	if got.GetAssignment() != nil {
+		t.Fatalf("worker assignment after DeleteActor = %+v, want nil", got.GetAssignment())
+	}
+}
+
+func TestDeleteActor_NotFoundReleasesWorkerAssignment(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	worker := &ateapipb.Worker{
+		WorkerNamespace: "default",
+		WorkerPool:      "pool-1",
+		WorkerPod:       "pod-1",
+		Assignment: &ateapipb.Assignment{
+			ActorTemplate: &ateapipb.KubeNamespacedObjectRef{
+				Namespace: "default",
+				Name:      "test-template",
+			},
+			Actor: &ateapipb.ObjectRef{Atespace: testAtespace, Name: "session-1"},
+		},
+	}
+	if err := s.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker failed: %v", err)
+	}
+
+	if _, err := s.DeleteActor(ctx, testAtespace, "session-1"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("DeleteActor error = %v, want ErrNotFound", err)
+	}
+
+	got, err := s.GetWorker(ctx, "default", "pool-1", "pod-1")
+	if err != nil {
+		t.Fatalf("GetWorker failed: %v", err)
+	}
+	if got.GetAssignment() != nil {
+		t.Fatalf("worker assignment after DeleteActor NotFound = %+v, want nil", got.GetAssignment())
+	}
+}
+
 func TestDeleteActor_NotFound(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
