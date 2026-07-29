@@ -95,7 +95,7 @@ func (r migrationReceiver) startProxy(ctx context.Context) (func(), error) {
 
 func proxyMigrationConn(ctx context.Context, src net.Conn, unixPath string) {
 	defer src.Close()
-	dst, err := dialUnixRetry(ctx, unixPath, 10*time.Second)
+	dst, err := dialUnixRetry(ctx, unixPath, liveMigrationUnixDialTimeout())
 	if err != nil {
 		slog.WarnContext(ctx, "live migration proxy failed to connect to CH unix receiver", slog.String("unix", unixPath), slog.Any("err", err))
 		return

@@ -16,6 +16,7 @@ package ch
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -51,6 +52,24 @@ type LaunchVMMOptions struct {
 	Stdout, Stderr interface{ Write([]byte) (int, error) }
 }
 
+// LaunchRestoreOptions configures launching cloud-hypervisor with --restore.
+type LaunchRestoreOptions struct {
+	// Binary is the cloud-hypervisor executable (defaults to "cloud-hypervisor").
+	Binary string
+	// APISocket is the api-socket path the restored VMM should listen on.
+	APISocket string
+	// SourceDir contains config.json, state.json, and memory-ranges.
+	SourceDir string
+	// MemoryRestoreMode is "Copy" or "OnDemand"; empty uses CH's default.
+	MemoryRestoreMode string
+	// Resume asks CH to resume the restored VM before returning from startup.
+	Resume bool
+	// Nets supplies replacement FDs for snapshots that were backed by net FDs.
+	Nets []RestoredNet
+	// Stdout/Stderr receive the VMM's output.
+	Stdout, Stderr interface{ Write([]byte) (int, error) }
+}
+
 // LaunchVMM starts a cloud-hypervisor process with only an api-socket (no VM)
 // and waits until it answers. Use Client.RestoreWithNetFDs to then restore a
 // snapshot that has fd-backed net devices. The caller owns cmd.
@@ -78,6 +97,77 @@ func LaunchVMM(ctx context.Context, o LaunchVMMOptions) (*exec.Cmd, *Client, err
 		return nil, nil, fmt.Errorf("while waiting for VMM api-socket: %w", err)
 	}
 	return cmd, client, nil
+}
+
+// LaunchRestoredVMM starts cloud-hypervisor with --restore and waits for the API
+// socket to answer after the restored VM has been created. This avoids the REST
+// vm.restore path for CH versions/configurations where that endpoint can wedge
+// while restoring large memory snapshots.
+func LaunchRestoredVMM(ctx context.Context, o LaunchRestoreOptions) (*exec.Cmd, *Client, error) {
+	if o.APISocket == "" {
+		return nil, nil, fmt.Errorf("LaunchRestoreOptions.APISocket is required")
+	}
+	if o.SourceDir == "" {
+		return nil, nil, fmt.Errorf("LaunchRestoreOptions.SourceDir is required")
+	}
+	bin := o.Binary
+	if bin == "" {
+		bin = "cloud-hypervisor"
+	}
+	_ = os.Remove(o.APISocket)
+	restoreArg, extraFiles := restoreCLIArg(o.SourceDir, o.MemoryRestoreMode, o.Resume, o.Nets)
+	cmd := exec.Command(bin, "--api-socket", o.APISocket, "--restore", restoreArg)
+	cmd.Stdout = o.Stdout
+	cmd.Stderr = o.Stderr
+	cmd.ExtraFiles = extraFiles
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("while starting restored cloud-hypervisor: %w", err)
+	}
+	client := NewClient(o.APISocket)
+	if err := client.WaitReady(ctx, 15*time.Second); err != nil {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+		return nil, nil, fmt.Errorf("while waiting for restored VMM api-socket: %w", err)
+	}
+	return cmd, client, nil
+}
+
+func restoreCLIArg(sourceDir, memMode string, resume bool, nets []RestoredNet) (string, []*os.File) {
+	parts := []string{"source_url=" + SnapshotURL(sourceDir)}
+	switch memMode {
+	case "Copy":
+		parts = append(parts, "memory_restore_mode=copy")
+	case "OnDemand":
+		parts = append(parts, "memory_restore_mode=ondemand")
+	}
+	if resume {
+		parts = append(parts, "resume=true")
+	}
+	var netEntries []string
+	var extraFiles []*os.File
+	nextFD := 3
+	for _, n := range nets {
+		if len(n.FDs) == 0 {
+			continue
+		}
+		var fds []string
+		for _, fd := range n.FDs {
+			f := os.NewFile(uintptr(fd), fmt.Sprintf("restore-net-%s", n.ID))
+			if f == nil {
+				continue
+			}
+			extraFiles = append(extraFiles, f)
+			fds = append(fds, fmt.Sprintf("%d", nextFD))
+			nextFD++
+		}
+		if len(fds) > 0 {
+			netEntries = append(netEntries, fmt.Sprintf("%s@[%s]", n.ID, strings.Join(fds, ",")))
+		}
+	}
+	if len(netEntries) > 0 {
+		parts = append(parts, fmt.Sprintf("net_fds=[%s]", strings.Join(netEntries, ",")))
+	}
+	return strings.Join(parts, ","), extraFiles
 }
 
 // RestoreWithNetFDs issues vm.restore for a snapshot dir, passing fresh tap FDs
@@ -210,6 +300,10 @@ type SnapshotNetDevice struct {
 	QueuePairs int
 	// MAC is the guest-visible MAC address of the device.
 	MAC string
+	// FDBacked is true when the snapshot net device was backed by FDs and needs
+	// replacement FDs on restore. false means CH should reopen the named tap from
+	// the snapshot config.
+	FDBacked bool
 }
 
 // SnapshotNetDevices parses a CH snapshot's config.json and returns its net
@@ -224,6 +318,7 @@ func SnapshotNetDevices(snapshotDir string) ([]SnapshotNetDevice, error) {
 			ID        string `json:"id"`
 			NumQueues int    `json:"num_queues"`
 			MAC       string `json:"mac"`
+			FDs       *json.RawMessage
 		} `json:"net"`
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
@@ -235,7 +330,12 @@ func SnapshotNetDevices(snapshotDir string) ([]SnapshotNetDevice, error) {
 		if qp < 1 {
 			qp = 1
 		}
-		out = append(out, SnapshotNetDevice{ID: n.ID, QueuePairs: qp, MAC: n.MAC})
+		fdBacked := false
+		if n.FDs != nil {
+			raw := bytes.TrimSpace(*n.FDs)
+			fdBacked = len(raw) > 0 && !bytes.Equal(raw, []byte("null"))
+		}
+		out = append(out, SnapshotNetDevice{ID: n.ID, QueuePairs: qp, MAC: n.MAC, FDBacked: fdBacked})
 	}
 	return out, nil
 }

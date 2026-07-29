@@ -94,7 +94,7 @@ func (s migrationSender) startProxyWithListen(ctx context.Context, listen func(n
 
 func proxyMigrationTCPConn(ctx context.Context, src net.Conn, destinationAddress string) {
 	defer src.Close()
-	dst, err := dialTCPRetry(ctx, destinationAddress, 10*time.Second)
+	dst, err := dialTCPRetry(ctx, destinationAddress, liveMigrationTCPDialTimeout())
 	if err != nil {
 		slog.WarnContext(ctx, "live migration sender proxy failed to connect to destination",
 			slog.String("destination", destinationAddress), slog.Any("err", err))

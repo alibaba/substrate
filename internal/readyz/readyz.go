@@ -28,6 +28,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,11 +41,11 @@ import (
 // a few seconds to bind; HTTPClient below is a var so tests can substitute
 // a transport that targets a test server's loopback address.
 const (
-	OverallTimeout   = 120 * time.Second
-	RequestTimeout   = 250 * time.Millisecond
-	PollInterval     = 1 * time.Millisecond
-	DefaultPath      = "/readyz"
-	maxIdleConnsHost = 1
+	defaultOverallTimeout = 120 * time.Second
+	RequestTimeout        = 250 * time.Millisecond
+	PollInterval          = 1 * time.Millisecond
+	DefaultPath           = "/readyz"
+	maxIdleConnsHost      = 1
 )
 
 // HTTPClient builds a keep-alive HTTP client tuned for fast, repeated
@@ -88,7 +90,8 @@ func Wait(ctx context.Context, containerName string, probe *ateompb.Readyz, acto
 	defer client.CloseIdleConnections()
 
 	start := time.Now()
-	deadline := start.Add(OverallTimeout)
+	overallTimeout := OverallTimeout()
+	deadline := start.Add(overallTimeout)
 	attempts := 0
 	var lastErr error
 	for {
@@ -98,7 +101,7 @@ func Wait(ctx context.Context, containerName string, probe *ateompb.Readyz, acto
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("readyz for %q never returned 200 within %s (%d attempts, last error: %v)",
-				containerName, OverallTimeout, attempts, lastErr)
+				containerName, overallTimeout, attempts, lastErr)
 		}
 
 		attempts++
@@ -124,6 +127,18 @@ func Wait(ctx context.Context, containerName string, probe *ateompb.Readyz, acto
 		case <-time.After(PollInterval):
 		}
 	}
+}
+
+func OverallTimeout() time.Duration {
+	raw := os.Getenv("ATE_READYZ_OVERALL_TIMEOUT_MS")
+	if raw == "" {
+		return defaultOverallTimeout
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return defaultOverallTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 func tryOnce(ctx context.Context, client *http.Client, url string) (bool, error) {

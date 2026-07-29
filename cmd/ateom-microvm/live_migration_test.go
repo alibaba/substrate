@@ -52,6 +52,30 @@ func TestMigrationReceiverForUnixDoesNotNeedProxy(t *testing.T) {
 	}
 }
 
+func TestLiveMigrationDialTimeoutsUseEnvironment(t *testing.T) {
+	t.Setenv("ATE_LIVE_MIGRATION_TCP_DIAL_TIMEOUT_MS", "250")
+	t.Setenv("ATE_LIVE_MIGRATION_UNIX_DIAL_TIMEOUT_MS", "500")
+
+	if got := liveMigrationTCPDialTimeout(); got != 250*time.Millisecond {
+		t.Fatalf("tcp dial timeout = %s, want 250ms", got)
+	}
+	if got := liveMigrationUnixDialTimeout(); got != 500*time.Millisecond {
+		t.Fatalf("unix dial timeout = %s, want 500ms", got)
+	}
+}
+
+func TestLiveMigrationDialTimeoutsRejectInvalidEnvironment(t *testing.T) {
+	t.Setenv("ATE_LIVE_MIGRATION_TCP_DIAL_TIMEOUT_MS", "0")
+	t.Setenv("ATE_LIVE_MIGRATION_UNIX_DIAL_TIMEOUT_MS", "nope")
+
+	if got := liveMigrationTCPDialTimeout(); got != 120*time.Second {
+		t.Fatalf("tcp dial timeout = %s, want default 120s", got)
+	}
+	if got := liveMigrationUnixDialTimeout(); got != 120*time.Second {
+		t.Fatalf("unix dial timeout = %s, want default 120s", got)
+	}
+}
+
 func TestMigrationReceiverProxyForwardsTCPToUnix(t *testing.T) {
 	vmDir, err := os.MkdirTemp("/tmp", "lm-")
 	if err != nil {
@@ -292,5 +316,42 @@ func TestMigrationSenderProxyRetriesDelayedDestination(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("destination server did not finish")
+	}
+}
+
+func TestMigrationSenderProxyHonorsTCPDialTimeout(t *testing.T) {
+	t.Setenv("ATE_LIVE_MIGRATION_TCP_DIAL_TIMEOUT_MS", "50")
+
+	portLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve destination tcp port: %v", err)
+	}
+	dstAddr := portLis.Addr().String()
+	if err := portLis.Close(); err != nil {
+		t.Fatalf("close reserved destination tcp port: %v", err)
+	}
+
+	sender, err := newMigrationSender("tcp:" + dstAddr)
+	if err != nil {
+		t.Fatalf("newMigrationSender: %v", err)
+	}
+	chURL, stop, err := sender.startProxy(context.Background())
+	if err != nil {
+		t.Fatalf("startProxy: %v", err)
+	}
+	defer stop()
+
+	conn, err := net.DialTimeout("tcp", strings.TrimPrefix(chURL, "tcp:"), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial source proxy: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatalf("proxy write: %v", err)
+	}
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err == nil {
+		t.Fatal("proxy read succeeded, want connection to close after destination dial timeout")
 	}
 }

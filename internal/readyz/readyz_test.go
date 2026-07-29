@@ -172,6 +172,22 @@ func TestWaitAll_SkipsContainersWithoutProbe(t *testing.T) {
 	}
 }
 
+func TestOverallTimeoutUsesEnvironment(t *testing.T) {
+	t.Setenv("ATE_READYZ_OVERALL_TIMEOUT_MS", "900000")
+
+	if got := OverallTimeout(); got != 15*time.Minute {
+		t.Fatalf("OverallTimeout()=%v, want 15m", got)
+	}
+}
+
+func TestOverallTimeoutRejectsInvalidEnvironment(t *testing.T) {
+	t.Setenv("ATE_READYZ_OVERALL_TIMEOUT_MS", "nope")
+
+	if got := OverallTimeout(); got != defaultOverallTimeout {
+		t.Fatalf("OverallTimeout()=%v, want default %v", got, defaultOverallTimeout)
+	}
+}
+
 func splitHostPort(t *testing.T, raw string) (string, int) {
 	t.Helper()
 	u, err := url.Parse(raw)

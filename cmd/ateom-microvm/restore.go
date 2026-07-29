@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -110,8 +111,9 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		}
 	}()
 
-	// Networking: rebuild the per-activation veth + tap; the snapshot's virtio-net
-	// is fd-backed, so CH needs fresh tap FDs (net_fds) on restore.
+	// Networking: rebuild the per-activation veth + tap. Tap-name snapshots need
+	// CH launched inside the interior netns so it can reopen the tap by name.
+	// FD-backed snapshots need fresh tap FDs passed via net_fds.
 	if err := s.setupActorNetwork(ctx); err != nil {
 		return nil, fmt.Errorf("while setting up actor network: %w", err)
 	}
@@ -128,6 +130,7 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 	}
 	var restoredNets []ch.RestoredNet
 	var tapFiles []*os.File
+	launchInInteriorNetNS := false
 	defer func() {
 		for _, f := range tapFiles {
 			_ = f.Close()
@@ -138,20 +141,49 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		if terr != nil {
 			return nil, fmt.Errorf("while building restore tap for %s: %w", nd.ID, terr)
 		}
-		tapFiles = append(tapFiles, files...)
-		rn := ch.RestoredNet{ID: nd.ID}
-		for _, f := range files {
-			rn.FDs = append(rn.FDs, int(f.Fd()))
+		if nd.FDBacked {
+			tapFiles = append(tapFiles, files...)
+			rn := ch.RestoredNet{ID: nd.ID}
+			for _, f := range files {
+				rn.FDs = append(rn.FDs, int(f.Fd()))
+			}
+			restoredNets = append(restoredNets, rn)
+		} else {
+			// In tap-name mode CH opens the tap itself by name inside the interior
+			// netns. Holding ateom's creation FDs open makes that open fail with EBUSY.
+			for _, f := range files {
+				_ = f.Close()
+			}
+			launchInInteriorNetNS = true
 		}
-		restoredNets = append(restoredNets, rn)
 	}
 
-	// Relaunch CH and restore with the tap FDs attached (SCM_RIGHTS). CH reopens
-	// /dev/vda (image) + each /dev/vd{b+i} (actor rootfs) from the snapshot config paths.
+	// Relaunch CH and restore. Most snapshots contain named tap devices, but some
+	// CH configurations can persist FD-backed net devices; restoredNets covers that
+	// case for both the REST and CLI restore paths.
 	apiSocket := filepath.Join(kata.VMDir(name), "clh-api-restore.sock")
-	chCmd, client, err := ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
-		Binary: rr.chBinary, APISocket: apiSocket, Stdout: slogWriter{ctx}, Stderr: slogWriter{ctx},
-	})
+	var chCmd *exec.Cmd
+	var client *ch.Client
+	restoreMode := microVMRestoreMemoryMode()
+	launch := func(ctx context.Context) error {
+		var launchErr error
+		if microVMRestoreLaunchMode() == "CLI" {
+			chCmd, client, launchErr = ch.LaunchRestoredVMM(ctx, ch.LaunchRestoreOptions{
+				Binary: rr.chBinary, APISocket: apiSocket, SourceDir: restoreDir, MemoryRestoreMode: restoreMode,
+				Resume: true, Nets: restoredNets, Stdout: slogWriter{ctx}, Stderr: slogWriter{ctx},
+			})
+		} else {
+			chCmd, client, launchErr = ch.LaunchVMM(ctx, ch.LaunchVMMOptions{
+				Binary: rr.chBinary, APISocket: apiSocket, Stdout: slogWriter{ctx}, Stderr: slogWriter{ctx},
+			})
+		}
+		return launchErr
+	}
+	if launchInInteriorNetNS {
+		err = netNSDo(ctx, s.interiorNetNS, launch)
+	} else {
+		err = launch(ctx)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("while launching VMM for restore: %w", err)
 	}
@@ -160,18 +192,18 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 			_ = chCmd.Process.Kill()
 		}
 	}()
-	// OnDemand (userfaultfd) memory restore: ~75ms vs ~1.8s eager, and it keeps the
-	// memfd SPARSE so the next suspend isn't the eager-copy-densified full-RAM scan.
-	// CH's OnDemand snapshot alone would be INCOMPLETE (it writes only faulted pages,
-	// dropping the un-faulted ones it demand-pages from this source) — so
-	// CheckpointWorkload overlays CH's delta onto this source (restoreSourceDir) to
-	// rebuild a complete snapshot. CH demand-pages from restoreDir for the VM's whole
-	// lifetime, so it must persist until teardown (atelet keeps it until reset).
-	if err := client.RestoreWithNetFDs(ctx, restoreDir, restoredNets, "OnDemand"); err != nil {
-		return nil, fmt.Errorf("while restoring VM with net FDs: %w", err)
-	}
-	if err := client.Resume(ctx); err != nil {
-		return nil, fmt.Errorf("while resuming restored guest: %w", err)
+	// OnDemand (userfaultfd) memory restore demand-pages from restoreDir for the
+	// VM's whole lifetime. Only that mode needs restoreSourceDir so a later
+	// non-preserve checkpoint can overlay CH's faulted-page delta onto the base.
+	// Copy restore eagerly loads RAM and produces complete future snapshots, so it
+	// must not be tagged as OnDemand-restored.
+	if microVMRestoreLaunchMode() != "CLI" {
+		if err := client.RestoreWithNetFDs(ctx, restoreDir, restoredNets, restoreMode); err != nil {
+			return nil, fmt.Errorf("while restoring VM with net FDs: %w", err)
+		}
+		if err := client.Resume(ctx); err != nil {
+			return nil, fmt.Errorf("while resuming restored guest: %w", err)
+		}
 	}
 
 	// Block until every readyz-enabled container reports 200.
@@ -179,7 +211,10 @@ func (s *AteomService) RestoreWorkload(ctx context.Context, req *ateompb.Restore
 		return nil, fmt.Errorf("while waiting for container readyz: %w", err)
 	}
 
-	ra := &runningActor{chCmd: chCmd, vfsdCmd: vfsdCmd, apiSocket: apiSocket, baseID: srcID, restoreSourceDir: restoreDir}
+	ra := &runningActor{chCmd: chCmd, vfsdCmd: vfsdCmd, apiSocket: apiSocket, baseID: srcID}
+	if restoreMode == "OnDemand" {
+		ra.restoreSourceDir = restoreDir
+	}
 
 	// Re-attach stdout/stderr forwarding for each container: the restored guest's
 	// containers + kata-agent are alive, so a fresh dial over this actor's vsock

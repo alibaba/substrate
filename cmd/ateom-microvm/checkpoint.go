@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
@@ -86,14 +87,24 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	}
 
 	checkpointDir := ateompath.CheckpointStateDir(atespace, name)
+	publishDir := ""
 	if directDir, ok, err := directSnapshotCheckpointDir(req.GetSnapshotUriPrefix()); err != nil {
 		return nil, err
 	} else if ok {
-		checkpointDir = directDir
-		slog.InfoContext(ctx, "Using direct SnapshotFS checkpoint directory",
-			slog.String("id", name),
-			slog.String("dir", checkpointDir),
-			slog.String("snapshot_uri_prefix", req.GetSnapshotUriPrefix()))
+		if os.Getenv("ATE_SNAPSHOT_DIRECT_STAGING") == "1" {
+			publishDir = directDir
+			slog.InfoContext(ctx, "Using staged direct SnapshotFS checkpoint directory",
+				slog.String("id", name),
+				slog.String("staging_dir", checkpointDir),
+				slog.String("publish_dir", publishDir),
+				slog.String("snapshot_uri_prefix", req.GetSnapshotUriPrefix()))
+		} else {
+			checkpointDir = directDir
+			slog.InfoContext(ctx, "Using direct SnapshotFS checkpoint directory",
+				slog.String("id", name),
+				slog.String("dir", checkpointDir),
+				slog.String("snapshot_uri_prefix", req.GetSnapshotUriPrefix()))
+		}
 	}
 	// Start from a clean dir so CH's snapshot files are the only contents.
 	if err := os.RemoveAll(checkpointDir); err != nil {
@@ -125,6 +136,19 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	}
 	dSnapshot := time.Since(tSnapshot)
 
+	resumedBeforePublish := false
+	if publishDir != "" && req.GetPreserveRunning() {
+		resumeOnReturn = false
+		tResume := time.Now()
+		if err := client.Resume(ctx); err != nil {
+			return nil, fmt.Errorf("while resuming guest after staged snapshot: %w", err)
+		}
+		resumedBeforePublish = true
+		slog.InfoContext(ctx, "Guest resumed before staged checkpoint publish",
+			slog.String("id", name),
+			slog.Duration("resume", time.Since(tResume)))
+	}
+
 	// Diff-snapshot completion for an OnDemand-restored actor: CH's snapshot here is
 	// sparse — only the pages faulted in since the OnDemand restore — so on its own
 	// it's INCOMPLETE (the un-faulted pages were being demand-paged from the restore
@@ -151,6 +175,19 @@ func (s *AteomService) CheckpointWorkload(ctx context.Context, req *ateompb.Chec
 	// Nothing rootfs-related ships: the overlay's writable upper is a guest tmpfs, so
 	// the actor's rootfs writes are already in the memory snapshot above, and the RO
 	// lower is reconstructed from the OCI image at restore (it never changes).
+	if publishDir != "" {
+		tPublish := time.Now()
+		if err := publishCheckpointDir(checkpointDir, publishDir); err != nil {
+			return nil, fmt.Errorf("while publishing staged checkpoint to %q: %w", publishDir, err)
+		}
+		slog.InfoContext(ctx, "Published staged checkpoint",
+			slog.String("id", name),
+			slog.String("staging_dir", checkpointDir),
+			slog.String("publish_dir", publishDir),
+			slog.Bool("guest_resumed_before_publish", resumedBeforePublish),
+			slog.Duration("publish", time.Since(tPublish)))
+		checkpointDir = publishDir
+	}
 
 	// Report exactly the files we wrote so atelet ships precisely the CH snapshot
 	// (config.json + state.json + memory-ranges + base-id). The RO base is
@@ -228,6 +265,50 @@ func listFiles(dir string) ([]string, error) {
 		}
 	}
 	return files, nil
+}
+
+func publishCheckpointDir(srcDir, dstDir string) error {
+	if err := os.RemoveAll(dstDir); err != nil {
+		return fmt.Errorf("while clearing destination: %w", err)
+	}
+	if err := os.MkdirAll(dstDir, 0o700); err != nil {
+		return fmt.Errorf("while creating destination: %w", err)
+	}
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return fmt.Errorf("while reading source: %w", err)
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		if err := copyRegularFile(filepath.Join(srcDir, entry.Name()), filepath.Join(dstDir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyRegularFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("while opening %q: %w", src, err)
+	}
+	defer in.Close()
+
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return fmt.Errorf("while creating %q: %w", dst, err)
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return fmt.Errorf("while copying %q to %q: %w", src, dst, copyErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("while closing %q: %w", dst, closeErr)
+	}
+	return nil
 }
 
 // teardownActor stops the ateom-owned CH VMM for an actor. Best-effort: the
