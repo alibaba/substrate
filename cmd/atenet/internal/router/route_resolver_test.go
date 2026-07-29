@@ -31,6 +31,7 @@ type routeResolverMockClient struct {
 	ateapipb.ControlClient
 	getRouteFn func(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error)
 	resumeFn   func(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error)
+	listFn     func(ctx context.Context, in *ateapipb.ListWorkersRequest, opts ...grpc.CallOption) (*ateapipb.ListWorkersResponse, error)
 }
 
 func (m *routeResolverMockClient) GetActorRoute(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error) {
@@ -43,6 +44,13 @@ func (m *routeResolverMockClient) GetActorRoute(ctx context.Context, in *ateapip
 func (m *routeResolverMockClient) ResumeActor(ctx context.Context, in *ateapipb.ResumeActorRequest, opts ...grpc.CallOption) (*ateapipb.ResumeActorResponse, error) {
 	if m.resumeFn != nil {
 		return m.resumeFn(ctx, in, opts...)
+	}
+	return nil, status.Error(codes.Unimplemented, "unimplemented")
+}
+
+func (m *routeResolverMockClient) ListWorkers(ctx context.Context, in *ateapipb.ListWorkersRequest, opts ...grpc.CallOption) (*ateapipb.ListWorkersResponse, error) {
+	if m.listFn != nil {
+		return m.listFn(ctx, in, opts...)
 	}
 	return nil, status.Error(codes.Unimplemented, "unimplemented")
 }
@@ -101,7 +109,10 @@ func TestTargetForRouteSwitched(t *testing.T) {
 
 func TestTargetForRouteFallbackToActorPodIP(t *testing.T) {
 	actor := &ateapipb.Actor{
-		AteomPodIp: "10.0.0.12",
+		AteomPodNamespace: "worker-ns",
+		AteomPodName:      "worker-a",
+		AteomPodIp:        "10.0.0.12",
+		WorkerPoolName:    "pool-a",
 		Route: &ateapipb.ActorRoute{
 			Phase:      ateapipb.ActorRoute_PHASE_UNSPECIFIED,
 			Generation: 0,
@@ -113,8 +124,49 @@ func TestTargetForRouteFallbackToActorPodIP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got.IP != "10.0.0.12" || got.Port != "80" || got.Generation != 0 || got.Phase != ateapipb.ActorRoute_PHASE_UNSPECIFIED {
+	if got.IP != "10.0.0.12" || got.Port != "80" || got.Generation != 1 || got.Phase != ateapipb.ActorRoute_PHASE_ACTIVE {
 		t.Fatalf("target = %+v", got)
+	}
+	if got.Namespace != "worker-ns" || got.Pod != "worker-a" || got.WorkerPool != "pool-a" {
+		t.Fatalf("target = %+v", got)
+	}
+}
+
+func TestActorRouteResolverEnrichesFallbackRouteFromWorkers(t *testing.T) {
+	client := &routeResolverMockClient{
+		getRouteFn: func(ctx context.Context, in *ateapipb.GetActorRouteRequest, opts ...grpc.CallOption) (*ateapipb.GetActorRouteResponse, error) {
+			return &ateapipb.GetActorRouteResponse{
+				Actor: &ateapipb.Actor{
+					Status:            ateapipb.Actor_STATUS_RUNNING,
+					AteomPodNamespace: "worker-ns",
+					AteomPodName:      "worker-a",
+					AteomPodIp:        "10.0.0.12",
+					WorkerPoolName:    "pool-a",
+				},
+			}, nil
+		},
+		listFn: func(ctx context.Context, in *ateapipb.ListWorkersRequest, opts ...grpc.CallOption) (*ateapipb.ListWorkersResponse, error) {
+			return &ateapipb.ListWorkersResponse{Workers: []*ateapipb.Worker{
+				{
+					WorkerNamespace: "worker-ns",
+					WorkerPod:       "worker-a",
+					WorkerPool:      "pool-a",
+					NodeName:        "node-a",
+				},
+			}}, nil
+		},
+	}
+	resolver := NewActorRouteResolver(client, NewActorResumer(client))
+
+	_, target, err := resolver.Resolve(context.Background(), "space-a", "actor-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target.Generation != 1 || target.Phase != ateapipb.ActorRoute_PHASE_ACTIVE {
+		t.Fatalf("target generation/phase = %d/%s, want 1/ACTIVE", target.Generation, target.Phase)
+	}
+	if target.Namespace != "worker-ns" || target.Pod != "worker-a" || target.Node != "node-a" || target.IP != "10.0.0.12" {
+		t.Fatalf("target = %+v", target)
 	}
 }
 

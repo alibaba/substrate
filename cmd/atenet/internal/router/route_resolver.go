@@ -27,8 +27,12 @@ import (
 )
 
 type routeTarget struct {
+	Namespace  string
+	Pod        string
 	IP         string
 	Port       string
+	WorkerPool string
+	Node       string
 	Generation int64
 	Phase      ateapipb.ActorRoute_Phase
 }
@@ -63,6 +67,7 @@ func (r *ActorRouteResolver) Resolve(ctx context.Context, atespace, actorName st
 	if err != nil {
 		return actor, routeTarget{}, err
 	}
+	target = r.enrichTargetFromWorkers(ctx, actor, target)
 	return actor, target, nil
 }
 
@@ -91,7 +96,29 @@ func (r *ActorRouteResolver) tryGetRoute(ctx context.Context, atespace, actorNam
 	if err != nil {
 		return actor, routeTarget{}, false, err
 	}
+	target = r.enrichTargetFromWorkers(ctx, actor, target)
 	return actor, target, true, nil
+}
+
+func (r *ActorRouteResolver) enrichTargetFromWorkers(ctx context.Context, actor *ateapipb.Actor, target routeTarget) routeTarget {
+	if target.Namespace == "" || target.Pod == "" || target.Node != "" {
+		return target
+	}
+	resp, err := r.apiClient.ListWorkers(ctx, &ateapipb.ListWorkersRequest{})
+	if err != nil {
+		return target
+	}
+	for _, worker := range resp.GetWorkers() {
+		if worker.GetWorkerNamespace() != target.Namespace || worker.GetWorkerPod() != target.Pod {
+			continue
+		}
+		target.Node = worker.GetNodeName()
+		if target.WorkerPool == "" {
+			target.WorkerPool = worker.GetWorkerPool()
+		}
+		return target
+	}
+	return target
 }
 
 func ensureActorRouteMetadata(actor *ateapipb.Actor, atespace, actorName string) {
@@ -110,7 +137,13 @@ func targetForActorRoute(actor *ateapipb.Actor) (routeTarget, error) {
 	route := actor.GetRoute()
 	target := route.GetActive()
 	if target.GetAteomPodIp() == "" {
-		target = &ateapipb.RouteTarget{AteomPodIp: actor.GetAteomPodIp()}
+		target = &ateapipb.RouteTarget{
+			AteomPodNamespace: actor.GetAteomPodNamespace(),
+			AteomPodName:      actor.GetAteomPodName(),
+			AteomPodIp:        actor.GetAteomPodIp(),
+			AteomPodUid:       actor.GetAteomPodUid(),
+			WorkerPoolName:    actor.GetWorkerPoolName(),
+		}
 	}
 
 	ip := target.GetAteomPodIp()
@@ -122,11 +155,24 @@ func targetForActorRoute(actor *ateapipb.Actor) (routeTarget, error) {
 		)
 	}
 
+	phase := route.GetPhase()
+	if phase == ateapipb.ActorRoute_PHASE_UNSPECIFIED {
+		phase = ateapipb.ActorRoute_PHASE_ACTIVE
+	}
+	generation := route.GetGeneration()
+	if generation == 0 {
+		generation = 1
+	}
+
 	return routeTarget{
+		Namespace:  target.GetAteomPodNamespace(),
+		Pod:        target.GetAteomPodName(),
 		IP:         ip,
 		Port:       "80",
-		Generation: route.GetGeneration(),
-		Phase:      route.GetPhase(),
+		WorkerPool: target.GetWorkerPoolName(),
+		Node:       target.GetNodeName(),
+		Generation: generation,
+		Phase:      phase,
 	}, nil
 }
 

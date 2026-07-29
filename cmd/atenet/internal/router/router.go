@@ -109,6 +109,7 @@ type RouterServer struct {
 
 	directProxyTransport http.RoundTripper
 	directProxyCache     directProxyResponseCache
+	directProxyLimiter   *directProxyUpstreamLimiter
 }
 
 func NewRouterServer(cfg RouterConfig) (*RouterServer, error) {
@@ -150,11 +151,12 @@ func NewRouterServer(cfg RouterConfig) (*RouterServer, error) {
 	}
 
 	return &RouterServer{
-		cfg:       cfg,
-		k8sClient: k8sClient,
-		clientset: clientset,
-		atStore:   store,
-		inflight:  newInFlightTracker(),
+		cfg:                cfg,
+		k8sClient:          k8sClient,
+		clientset:          clientset,
+		atStore:            store,
+		inflight:           newInFlightTracker(),
+		directProxyLimiter: newDirectProxyUpstreamLimiter(),
 	}, nil
 }
 

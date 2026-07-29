@@ -128,6 +128,8 @@ spec:
         - "--standalone"
         - "--namespace=ate-system"
         - "--port-http=8080"
+        - "--direct-http-proxy"
+        - "--direct-http-proxy-port=18080"
         - "--port-xds=18000"
         - "--port-extproc=50051"
         - "--extproc-address=127.0.0.1"
@@ -163,6 +165,8 @@ spec:
           containerPort: 4040
         - name: metrics
           containerPort: 9090
+        - name: direct-http
+          containerPort: 18080
       - name: envoy
         image: envoyproxy/envoy:v1.30-latest
         command:
@@ -212,4 +216,19 @@ spec:
   - name: https
     port: 443
     targetPort: 8443
+    protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atenet-router-direct
+  namespace: ate-system
+spec:
+  type: ClusterIP
+  selector:
+    app: atenet-router
+  ports:
+  - name: http
+    port: 80
+    targetPort: 18080
     protocol: TCP
