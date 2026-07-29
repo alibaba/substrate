@@ -15,6 +15,7 @@
 package perfdata
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -96,7 +97,7 @@ func TestReadLifecycleJSONLPreservesCrossNodeRecoverProof(t *testing.T) {
 }
 
 func TestReadLifecycleJSONLPreservesHotMigrationProof(t *testing.T) {
-	input := strings.NewReader(`{"operation":"hot_migration_summary","duration_ms":12345,"source_worker":"ate-system/source","source_node":"node-a","target_worker":"ate-system/target","target_node":"node-b","cross_node":true,"route_generation_before":1,"route_generation_after":2,"longest_success_gap_ms":250,"total_to_target_success_ms":12345,"probe_requests":10,"probe_successes":10,"probe_status_counts":{"200":10}}` + "\n")
+	input := strings.NewReader(`{"operation":"hot_migration_summary","duration_ms":12345,"source_worker":"ate-system/source","source_node":"node-a","target_worker":"ate-system/target","target_node":"node-b","cross_node":true,"live_migration_downtime_ms":250,"live_migration_connections":8,"live_migration_memory_mode":"Precopy","migration_window_resource_result":"ok","end_to_end_resource_result":"pending_cleanup","route_generation_before":1,"route_generation_after":2,"http_counter":3,"http_state_version":4,"http_last_mutation_id":"increment-3","http_boot_id":"boot-a","http_pod_name":"pod-a","http_node_name":"node-b","http_route_generation":2,"http_route_phase":"PHASE_SWITCHED","http_route_target_worker":"ate-system/target","http_route_target_node":"node-b","http_route_target_ip":"10.0.0.2","longest_success_gap_ms":250,"max_request_start_gap_ms":110,"max_success_completion_gap_ms":560,"max_single_request_latency_ms":971,"total_to_target_success_ms":12345,"probe_requests":10,"probe_successes":10,"probe_canceled_by_stop":1,"missing_route_proof_count":0,"probe_status_counts":{"200":10},"mutation_requests":5,"mutation_successes":5,"mutation_failures":0,"mutation_canceled_by_stop":1,"mutation_max_accepted_counter":8,"mutation_duplicate_count":0,"mutation_lost_accepted_count":0,"monotonic_violation_count":0,"stale_version_count":0,"missing_state_proof_count":0,"route_switched_probe_requests":3,"route_switched_probe_successes":3,"service_errors_during_route_switched":0,"route_target_mismatch_during_route_switched":0,"missing_route_proof_during_route_switched":0,"mutation_route_switched_probe_requests":2,"mutation_route_switched_probe_successes":2,"mutation_service_errors_during_route_switched":0,"mutation_route_target_mismatch_during_route_switched":0,"mutation_missing_route_proof_during_route_switched":0}` + "\n")
 
 	events, err := ReadLifecycleJSONL(input, Defaults{Round: "hot-migration-con1", NodeScale: 8, Concurrency: 1})
 	if err != nil {
@@ -109,11 +110,65 @@ func TestReadLifecycleJSONLPreservesHotMigrationProof(t *testing.T) {
 	if ev.RouteGenerationBefore != 1 || ev.RouteGenerationAfter != 2 {
 		t.Fatalf("route generation=%d/%d, want 1/2", ev.RouteGenerationBefore, ev.RouteGenerationAfter)
 	}
-	if ev.LongestSuccessGapMS != 250 || ev.TotalToTargetSuccessMS != 12345 {
-		t.Fatalf("hot migration timing=%d/%d", ev.LongestSuccessGapMS, ev.TotalToTargetSuccessMS)
+	if ev.LiveMigrationDowntimeMS != 250 || ev.LiveMigrationConnections != 8 || ev.LiveMigrationMemoryMode != "Precopy" {
+		t.Fatalf("live migration config proof not preserved: %+v", ev)
+	}
+	if ev.MigrationWindowResourceResult != "ok" || ev.EndToEndResourceResult != "pending_cleanup" {
+		t.Fatalf("resource verdict proof not preserved: %+v", ev)
+	}
+	if ev.HTTPCounter != 3 || ev.HTTPStateVersion != 4 || ev.HTTPLastMutationID != "increment-3" || ev.HTTPBootID != "boot-a" {
+		t.Fatalf("HTTP state proof not preserved: %+v", ev)
+	}
+	if ev.HTTPRouteGeneration != 2 || ev.HTTPRoutePhase != "PHASE_SWITCHED" || ev.HTTPRouteTargetWorker != "ate-system/target" || ev.HTTPRouteTargetNode != "node-b" || ev.HTTPRouteTargetIP != "10.0.0.2" {
+		t.Fatalf("route trace proof not preserved: %+v", ev)
+	}
+	if ev.LongestSuccessGapMS != 250 || ev.MaxRequestStartGapMS != 110 || ev.MaxSuccessCompletionGapMS != 560 || ev.MaxSingleRequestLatencyMS != 971 || ev.TotalToTargetSuccessMS != 12345 {
+		t.Fatalf("hot migration timing not preserved: %+v", ev)
 	}
 	if ev.ProbeStatusCounts["200"] != 10 {
 		t.Fatalf("probe status counts=%v", ev.ProbeStatusCounts)
+	}
+	if ev.ProbeCanceledByStop != 1 || ev.MissingRouteProofCount != 0 {
+		t.Fatalf("probe proof counters not preserved: %+v", ev)
+	}
+	if ev.MutationRequests != 5 || ev.MutationSuccesses != 5 || ev.MutationCanceledByStop != 1 || ev.MutationMaxAcceptedCounter != 8 {
+		t.Fatalf("mutation counters not preserved: %+v", ev)
+	}
+	if ev.MutationFailures != 0 || ev.MutationDuplicateCount != 0 || ev.MutationLostAcceptedCount != 0 {
+		t.Fatalf("mutation violation counters not preserved: %+v", ev)
+	}
+	if ev.MonotonicViolationCount != 0 || ev.StaleVersionCount != 0 || ev.MissingStateProofCount != 0 {
+		t.Fatalf("consistency counters not preserved: %+v", ev)
+	}
+	if ev.RouteSwitchedProbeRequests != 3 || ev.RouteSwitchedProbeSuccesses != 3 || ev.ServiceErrorsDuringRouteSwitched != 0 || ev.RouteTargetMismatchDuringRouteSwitched != 0 || ev.MissingRouteProofDuringRouteSwitched != 0 {
+		t.Fatalf("route-switched HTTP proof not preserved: %+v", ev)
+	}
+	if ev.MutationRouteSwitchedProbeRequests != 2 || ev.MutationRouteSwitchedProbeSuccesses != 2 || ev.MutationServiceErrorsDuringRouteSwitched != 0 || ev.MutationRouteTargetMismatchDuringRouteSwitched != 0 || ev.MutationMissingRouteProofDuringRouteSwitched != 0 {
+		t.Fatalf("route-switched mutation proof not preserved: %+v", ev)
+	}
+}
+
+func TestMarshalLifecycleEventKeepsZeroRouteSwitchedProofCounters(t *testing.T) {
+	b, err := json.Marshal(LifecycleEvent{Operation: "hot_migration_summary"})
+	if err != nil {
+		t.Fatalf("Marshal returned error: %v", err)
+	}
+	got := string(b)
+	for _, want := range []string{
+		`"route_switched_probe_requests":0`,
+		`"route_switched_probe_successes":0`,
+		`"service_errors_during_route_switched":0`,
+		`"route_target_mismatch_during_route_switched":0`,
+		`"missing_route_proof_during_route_switched":0`,
+		`"mutation_route_switched_probe_requests":0`,
+		`"mutation_route_switched_probe_successes":0`,
+		`"mutation_service_errors_during_route_switched":0`,
+		`"mutation_route_target_mismatch_during_route_switched":0`,
+		`"mutation_missing_route_proof_during_route_switched":0`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("marshaled event %s missing %s", got, want)
+		}
 	}
 }
 

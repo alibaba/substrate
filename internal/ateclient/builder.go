@@ -23,6 +23,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/agent-substrate/substrate/pkg/proto/ateapipb"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
@@ -33,8 +34,10 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 
 	authv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
@@ -117,6 +120,7 @@ func dialDirectWithBearerToken(endpoint, token string, traceEnabled bool) (*Clie
 
 	var opts []grpc.DialOption
 	opts = append(opts, grpc.WithTransportCredentials(creds))
+	opts = append(opts, grpc.WithKeepaliveParams(clientKeepaliveParams()))
 	opts = append(opts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	if token != "" {
 		opts = append(opts, grpc.WithPerRPCCredentials(bearerTokenCreds(token)))
@@ -182,7 +186,7 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext string, tra
 	if len(pods.Items) == 0 {
 		return nil, fmt.Errorf("no ate-api-server pods found in ate-system namespace")
 	}
-	targetPod := pods.Items[0]
+	targetPod := selectPortForwardPod(pods.Items)
 
 	// Setup port-forwarding
 	req := clientset.CoreV1().RESTClient().Post().
@@ -243,6 +247,7 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext string, tra
 
 	var opts []grpc.DialOption
 	opts = append(opts, grpc.WithTransportCredentials(transportCreds))
+	opts = append(opts, grpc.WithKeepaliveParams(clientKeepaliveParams()))
 	opts = append(opts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	jwtOpts, err := jwtDialOptions(ctx, clientset)
 	if err != nil {
@@ -269,6 +274,34 @@ func dialPortForward(ctx context.Context, kubeconfigPath, k8sContext string, tra
 			wg.Wait()
 		},
 	}, nil
+}
+
+func selectPortForwardPod(pods []corev1.Pod) corev1.Pod {
+	for _, pod := range pods {
+		if pod.Status.Phase != corev1.PodRunning {
+			continue
+		}
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == corev1.PodReady && condition.Status == corev1.ConditionTrue {
+				return pod
+			}
+		}
+	}
+	return pods[0]
+}
+
+func clientKeepaliveParams() keepalive.ClientParameters {
+	keepaliveTime := 10 * time.Minute
+	if raw := os.Getenv("ATE_CLIENT_KEEPALIVE_TIME"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil {
+			keepaliveTime = parsed
+		}
+	}
+	return keepalive.ClientParameters{
+		Time:                keepaliveTime,
+		Timeout:             20 * time.Second,
+		PermitWithoutStream: false,
+	}
 }
 
 func jwtDialOptions(ctx context.Context, clientset *kubernetes.Clientset) ([]grpc.DialOption, error) {

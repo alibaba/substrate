@@ -14,7 +14,13 @@
 
 package ateclient
 
-import "testing"
+import (
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
 
 func TestIsJWTAuthModeArg(t *testing.T) {
 	tests := []struct {
@@ -36,5 +42,74 @@ func TestIsJWTAuthModeArg(t *testing.T) {
 				t.Fatalf("isJWTAuthModeArg(%v) = %v, want %v", tt.args, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestClientKeepaliveParams(t *testing.T) {
+	t.Setenv("ATE_CLIENT_KEEPALIVE_TIME", "")
+	got := clientKeepaliveParams()
+	if got.Time != 10*time.Minute {
+		t.Fatalf("default keepalive time = %s, want 10m", got.Time)
+	}
+	if got.Timeout != 20*time.Second {
+		t.Fatalf("keepalive timeout = %s, want 20s", got.Timeout)
+	}
+	if got.PermitWithoutStream {
+		t.Fatal("PermitWithoutStream = true, want false")
+	}
+}
+
+func TestClientKeepaliveParamsFromEnv(t *testing.T) {
+	t.Setenv("ATE_CLIENT_KEEPALIVE_TIME", "30m")
+	got := clientKeepaliveParams()
+	if got.Time != 30*time.Minute {
+		t.Fatalf("env keepalive time = %s, want 30m", got.Time)
+	}
+}
+
+func TestClientKeepaliveParamsIgnoresInvalidEnv(t *testing.T) {
+	t.Setenv("ATE_CLIENT_KEEPALIVE_TIME", "not-a-duration")
+	got := clientKeepaliveParams()
+	if got.Time != 10*time.Minute {
+		t.Fatalf("invalid env keepalive time = %s, want default 10m", got.Time)
+	}
+}
+
+func TestSelectPortForwardPodPrefersReadyRunningPod(t *testing.T) {
+	pods := []corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "old-error"},
+			Status:     corev1.PodStatus{Phase: corev1.PodFailed},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "new-ready"},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+				},
+			},
+		},
+	}
+
+	if got := selectPortForwardPod(pods); got.Name != "new-ready" {
+		t.Fatalf("selectPortForwardPod() = %q, want new-ready", got.Name)
+	}
+}
+
+func TestSelectPortForwardPodFallsBackToFirstPod(t *testing.T) {
+	pods := []corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "first"},
+			Status:     corev1.PodStatus{Phase: corev1.PodPending},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "second"},
+			Status:     corev1.PodStatus{Phase: corev1.PodFailed},
+		},
+	}
+
+	if got := selectPortForwardPod(pods); got.Name != "first" {
+		t.Fatalf("selectPortForwardPod() = %q, want first", got.Name)
 	}
 }

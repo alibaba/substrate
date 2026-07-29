@@ -476,17 +476,31 @@ func runHotMigration(args []string) error {
 	fs := flag.NewFlagSet("run-hot-migration", flag.ExitOnError)
 	var cfg runner.HotMigrationConfig
 	outPath := fs.String("out", "", "output lifecycle JSONL path")
+	extraProbePaths := fs.String("extra-probe-paths", "", "comma-separated extra continuous GET probes, optionally label=/path")
+	preMigrationPostPaths := fs.String("pre-migration-post-paths", "", "comma-separated POST hooks to run after state mutations and before migration, optionally label=/path")
 	fs.StringVar(&cfg.Kubeconfig, "kubeconfig", "", "kubeconfig path")
 	fs.StringVar(&cfg.RunID, "run-id", "", "run id")
 	fs.StringVar(&cfg.Atespace, "atespace", "", "atespace name")
 	fs.IntVar(&cfg.Count, "count", 1, "actor count")
 	fs.IntVar(&cfg.Concurrency, "concurrency", 1, "concurrency; hot migration requires 1")
 	fs.StringVar(&cfg.ProbePath, "probe-path", "/substrate/migration-state", "HTTP path to probe continuously")
+	fs.StringVar(&cfg.SSEPath, "sse-path", "", "optional SSE path to keep open during migration, e.g. /stream")
+	fs.StringVar(&cfg.TerminalWebSocketPath, "terminal-websocket-path", "", "optional WebSocket terminal path to keep open during migration, e.g. /terminal/ws")
 	fs.StringVar(&cfg.MutationPath, "mutation-path", "/increment", "HTTP path to POST before migration to create runtime state")
 	fs.IntVar(&cfg.StateMutations, "state-mutations", 1, "number of pre-migration mutation POSTs")
+	fs.DurationVar(&cfg.MutationInterval, "continuous-mutation-interval", 0, "optional interval for continuous POST mutations during hot migration; 0 disables continuous mutations")
+	fs.Int64Var(&cfg.MutationBodyBytes, "mutation-body-bytes", 0, "optional request body size for mutation POSTs, used for upload scenarios")
 	fs.DurationVar(&cfg.ProbeInterval, "probe-interval", 100*time.Millisecond, "continuous HTTP probe interval")
+	fs.Int64Var(&cfg.ProbeReadLimitBytes, "probe-read-limit-bytes", 64*1024, "maximum response body bytes to read for each HTTP probe")
 	fs.DurationVar(&cfg.DrainTimeout, "drain-timeout", 3*time.Second, "CommitActorMigration drain timeout")
 	fs.DurationVar(&cfg.PostCommitProbeTimeout, "post-commit-probe-timeout", 30*time.Second, "maximum time to wait for target HTTP success after commit")
+	fs.DurationVar(&cfg.CleanupIsolationDuration, "cleanup-isolation-duration", 0, "optional post-switch observation duration to keep probes running after target success/source release; final actor suspend/delete runs after summary")
+	fs.DurationVar(&cfg.MigrationRPCTimeout, "migration-rpc-timeout", 180*time.Second, "maximum time to wait for prepare or commit migration RPC")
+	fs.Int64Var(&cfg.LiveMigrationDowntimeMS, "live-migration-downtime-ms", 0, "expected Cloud Hypervisor live migration downtime_ms; recorded in raw evidence only")
+	fs.IntVar(&cfg.LiveMigrationConnections, "live-migration-connections", 0, "expected Cloud Hypervisor live migration connection count; recorded in raw evidence only")
+	fs.StringVar(&cfg.LiveMigrationMemoryMode, "live-migration-memory-mode", "", "expected Cloud Hypervisor live migration memory mode; recorded in raw evidence only")
+	fs.BoolVar(&cfg.RequireRouteSwitchedProbe, "require-route-switched-probe", false, "require at least one successful route PHASE_SWITCHED probe sample during commit; used for source-release isolation evidence")
+	fs.BoolVar(&cfg.SkipFinalActorCleanup, "skip-final-actor-cleanup", false, "skip post-summary suspend/delete; caller must clean test workers")
 	fs.DurationVar(&cfg.ActorTemplateTimeout, "actor-template-timeout", 30*time.Minute, "maximum time to wait for ActorTemplate Ready with a golden snapshot")
 	fs.BoolVar(&cfg.RequireCrossNode, "require-cross-node", true, "require target worker on a different node")
 	fs.BoolVar(&cfg.RequireQuiesce, "require-quiesce", false, "request control plane quiesce during commit when supported")
@@ -504,6 +518,12 @@ func runHotMigration(args []string) error {
 	}
 	if *outPath == "" {
 		return fmt.Errorf("--out is required")
+	}
+	if *extraProbePaths != "" {
+		cfg.ExtraProbePaths = splitNonEmptyCSV(*extraProbePaths)
+	}
+	if *preMigrationPostPaths != "" {
+		cfg.PreMigrationPostPaths = splitNonEmptyCSV(*preMigrationPostPaths)
 	}
 	labels, err := parseLabelMap(*targetWorkerLabels)
 	if err != nil {
@@ -600,6 +620,17 @@ func parseLabelMap(raw string) (map[string]string, error) {
 		out[strings.TrimSpace(key)] = strings.TrimSpace(value)
 	}
 	return out, nil
+}
+
+func splitNonEmptyCSV(raw string) []string {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func writeConfigMapChunks(ctx context.Context, kubeconfig string, target configMapOutput, data []byte) error {
