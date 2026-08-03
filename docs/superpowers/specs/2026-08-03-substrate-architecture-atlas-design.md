@@ -16,6 +16,7 @@ The primary audience is engineers who need to understand, operate, review, or co
 - actor, worker, snapshot, networking, identity, and telemetry flows;
 - gVisor and microVM sandbox paths;
 - lifecycle operations, including create, golden snapshot, resume, pause, suspend, and live migration;
+- a practical source-code guide that connects architectural concepts to entry points, packages, protocols, tests, and common development tasks;
 - current implementation status, known limitations, roadmap architecture, and north-star goals.
 
 The atlas does not enumerate every Go package or function. It does not access a cluster, cloud API, or runtime environment, and it does not include credentials or environment-specific deployment values.
@@ -36,8 +37,23 @@ The HTML uses a fixed section navigation and a top-down reading path:
 10. Observability
 11. Lifecycle and communication sequences
 12. Current implementation and target architecture
+13. Source-code reading guide
 
 The page begins with a concise executive explanation, then moves from system boundaries into component internals, and finally reconnects the components through lifecycle and communication flows.
+
+## Source-Code Reading Guide
+
+The final section turns the architecture atlas into an implementation guide. It includes:
+
+- a recommended reading path from public APIs and resource types to component entry points and workflow implementations;
+- a directory map covering `cmd/`, `internal/`, `pkg/`, `manifests/`, `hack/`, `tools/`, `demos/`, and `benchmarking/`;
+- an entry-point index for every core binary with its startup wiring and principal internal packages;
+- annotated call chains for actor creation, route lookup and request-triggered resume, pause/suspend, restore, checkpoint upload/download, and live migration;
+- mappings between public gRPC methods, internal gRPC methods, CRD types, dynamic store records, and responsible implementations;
+- a task-oriented index for common changes such as adding an API, changing scheduling, adding a sandbox operation, modifying routing, extending snapshot storage, adding telemetry, or updating a CRD;
+- test locations and the smallest relevant verification commands for each subsystem.
+
+The guide links to repository-relative source paths and uses stable file/package landmarks rather than fragile line-number references. It explains representative execution paths without attempting to document every function.
 
 ## Diagram Inventory
 
@@ -50,6 +66,7 @@ The atlas contains the following diagrams:
 - one Actor lifecycle state machine;
 - sequence diagrams for Actor creation and golden snapshot creation, request-triggered resume, pause, suspend, explicit resume, and live migration;
 - one current-versus-target architecture matrix.
+- source-navigation maps for repository layout, binary-to-package ownership, and representative call chains.
 
 Communication edges identify the relevant boundary, such as gRPC, HTTP, DNS, Kubernetes API, Valkey/Redis, object storage, OTLP, or sandbox-runtime calls.
 
@@ -114,6 +131,7 @@ Completion requires:
 - HTML parsing and JavaScript syntax checks;
 - confirmation that no remote assets or unresolved placeholders remain;
 - source-reference and component-inventory checks;
+- confirmation that every core binary, public/internal RPC service, CRD, and principal architecture package appears in the source-code guide;
 - browser verification of navigation, filters, collapsible sections, diagram controls, printing, and responsive behavior;
 - screenshot review of the overview, component decomposition, and sequence diagrams for clipping, overlap, and unreadable labels;
 - a final consistency pass against source code, protobufs, manifests, and current documentation.
