@@ -155,6 +155,7 @@ func (c *MemoryPullCache) Fetch(ctx context.Context, ref string) (io.ReadCloser,
 		// to completion in background goroutines (which retain partial-blob
 		// buffers and amplify atelet RSS during ResumeActor death loops).
 		remote.WithContext(ctx),
+		remote.WithAuthFromKeychain(authn.DefaultKeychain),
 		remote.WithPlatform(v1.Platform{
 			Architecture: runtime.GOARCH,
 			OS:           "linux",
